@@ -1,7 +1,7 @@
 [project]
 name = "timage-forecasting"
 version = "0.1.0"
-description = "multi modal time series forecasting with image data"
+description = "multi-modal time series forecasting with image data"
 authors = [
     {name = "minkeymouse",email = "minkey.chang@gmail.com"}
 ]
@@ -15,3 +15,7 @@ dependencies = [
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.1"
+
