@@ -14,7 +14,7 @@ from pytorch_forecasting.models.base import BaseModelWithCovariates
 from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
 
 from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
-from timage_forecasting.sub_modules import *
+from timage_forecasting.sub_modules import _TimeSeriesEncoder
 
 
 class Timage(BaseModelWithCovariates):
@@ -48,6 +48,7 @@ class Timage(BaseModelWithCovariates):
         x_image: Optional[list[str]] = None,
 
 
+        # Haven't decided what to do yet.
         temporal_width_future: int = 4,
         temporal_hidden_size_future: int = 32,
         temporal_decoder_hidden: int = 32,
@@ -97,7 +98,7 @@ class Timage(BaseModelWithCovariates):
             x_categoricals=self.hparams.x_categoricals,
         )
 
-        self.model = _TideModule(
+        self.model_img = _temporalViT(
             output_dim=self.output_dim,
             future_cov_dim=self.encoder_covariate_size,
             static_cov_dim=self.static_size,
@@ -114,6 +115,47 @@ class Timage(BaseModelWithCovariates):
             temporal_hidden_size_future=temporal_hidden_size_future,
         )
 
+        self.model_ts = _SeriesEncoder(
+
+        )
+
+        self.lookback_skip = nn.Linear(
+        self.input_chunk_length, self.output_chunk_length)
+
+    def training_step(self, batch, batch_idx):
+        x, (y, w) = batch
+        x = 
+        scores
+        loss = 
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        return super().validation_step(batch, batch_idx)
+    
+    def test_step(self, batch, batch_idx):
+        return super().test_step(batch, batch_idx)
+    
+    def _vision_embedding(self, )
+        
+    def _time_series_embedding(self, )
+    
+    def configure_optimizers(self):
+        """Configure optimizers and learning rate schedulers."""
+        optimizer = torch.optim.AdamW(
+            self.parameters(), lr=self.hparams.learning_rate, weight_decay=1e-6
+        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=10, verbose=True
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "frequency": 1,
+            },
+        }
+    
     @property
     def decoder_covariate_size(self) -> int:
         """Decoder covariates size.
@@ -200,6 +242,11 @@ class Timage(BaseModelWithCovariates):
         new_kwargs.update(cls.deduce_default_output_parameters(dataset, kwargs, MAE()))
         # initialize class
         return super().from_dataset(dataset, **new_kwargs)
+    
+    def extract_image(self, x, img_columns):
+        imgs = x["x_image"]
+        return 
+
 
     def forward(self, x: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """

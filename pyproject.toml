@@ -15,9 +15,12 @@ dependencies = [
     "torch (>=2.7.1,<3.0.0)",
     "torchvision (>=0.22.1,<0.23.0)",
     "torchaudio (>=2.7.1,<3.0.0)",
-    "pytorch-forecasting (>=1.4.0,<2.0.0)"
+    "pytorch-forecasting (>=1.4.0,<2.0.0)",
+    "transformers (>=4.53.0,<5.0.0)"
 ]
 
+[tool.poetry.dependencies]
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "v2.2.4" }
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

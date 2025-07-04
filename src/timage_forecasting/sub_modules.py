@@ -4,416 +4,266 @@ from math import sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_lightning import LightningModule
+import pytorch_lightning as pl
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytorch_forecasting
+from pytorch_forecasting.models.temporal_fusion_transformer.sub_modules import GatedResidualNetwork as _GRN
+from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention, TriangularCausalMask
+from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock as _RB
 
-class TemporalPatchEmbed(nn.Module):
-    def __init__(self, in_chans=3, patch_size=16, embed_dim=768):
-        super().__init__()
-        # for a single 16×16 patch per time-step
-        self.flatten_dim = in_chans * patch_size * patch_size
-        self.proj = nn.Linear(self.flatten_dim, embed_dim)
-    def forward(self, x):
-        # x: [B, T, C, P, P]
-        B, T, C, P, _ = x.shape
-        x = x.view(B, T, -1)            # [B, T, C·P·P]
-        x = self.proj(x)                # [B, T, D]
-        return x
+# Time series Encoder
 
-class TemporalViT(LightningModule):
-    def __init__(
-        self,
-        seq_len: int,
-        in_chans=3,
-        patch_size=16,
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        mlp_ratio=4.0,
-        num_classes=1,    # e.g. regression or forecasting
-        lr=1e-3
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        # 1) patch→token (one token per time step)
-        self.patch_embed = TemporalPatchEmbed(
-            in_chans, patch_size, embed_dim
-        )
-
-        # 2) [CLS] + temporal pos-embeddings
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + 1, embed_dim))
-        self.pos_drop = nn.Dropout(0.1)
-
-        # 3) Transformer Encoder
-        encoder_layer = TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=0.1,
-            activation="gelu"
-        )
-        self.encoder = TransformerEncoder(encoder_layer, num_layers=depth)
-
-        # 4) head
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
-
-        # init
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        # x: [B, T, C, P, P]
-        B, T, C, P, _ = x.shape
-        tokens = self.patch_embed(x)         # [B, T, D]
-        cls   = self.cls_token.expand(B, -1, -1)  # [B, 1, D]
-        x     = torch.cat([cls, tokens], dim=1)   # [B, T+1, D]
-        x     = x + self.pos_embed
-        x     = self.pos_drop(x)
-
-        x = self.encoder(x)    # [B, T+1, D]
-        x = self.norm(x)
-        return self.head(x[:, 0])  # use CLS for final output
-
-    def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss  = F.mse_loss(y_hat.view(-1), y.view(-1))
-        self.log("train/loss", loss)
-        return loss
-
-    def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
-
-
-"""
-Time-series Dense Encoder (TiDE)
---------------------------------
-"""
-
-from typing import Optional
-
-import torch
-import torch.nn as nn
-
-MixedCovariatesTrainTensorType = tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]
-
-
-class _ResidualBlock(nn.Module):
-    def __init__(
-        self,
-        input_dim: int,
-        output_dim: int,
-        hidden_size: int,
-        dropout: float,
-        use_layer_norm: bool,
-    ):
-        """Pytorch module implementing the Residual Block from the TiDE paper."""
-        super().__init__()
-
-        # dense layer with ReLU activation with dropout
-        self.dense = nn.Sequential(
-            nn.Linear(input_dim, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, output_dim),
-            nn.Dropout(dropout),
-        )
-
-        # linear skip connection from input to output of self.dense
-        self.skip = nn.Linear(input_dim, output_dim)
-
-        # layer normalization as output
-        if use_layer_norm:
-            self.layer_norm = nn.LayerNorm(output_dim)
-        else:
-            self.layer_norm = None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # residual connection
-        x = self.dense(x) + self.skip(x)
-
-        # layer normalization
-        if self.layer_norm is not None:
-            x = self.layer_norm(x)
-
-        return x
-
-
-class _TideModule(nn.Module):
+class _TimeSeriesEncoder(nn.Module):
     def __init__(
         self,
         output_dim: int,
         future_cov_dim: int,
+        temporal_hidden_size_future: int,
+        temporal_width_future: int,
         static_cov_dim: int,
         output_chunk_length: int,
         input_chunk_length: int,
         num_encoder_layers: int,
-        num_decoder_layers: int,
-        decoder_output_dim: int,
         hidden_size: int,
-        temporal_decoder_hidden: int,
-        temporal_width_future: int,
+        embed_dim: int,
         use_layer_norm: bool,
         dropout: float,
-        temporal_hidden_size_future: int,
     ):
-        """PyTorch module implementing the TiDE architecture.
-
-        Parameters
-        ----------
-        input_dim
-            The total number of input features, including the target
-            and optional covariates.
-        output_dim
-            The number of output features in the target.
-        future_cov_dim
-            The number of covariates available for the future time steps.
-        static_cov_dim
-            The number of covariates that remain constant across time steps.
-        num_encoder_layers
-            The number of stacked Residual Blocks used in the encoder.
-        num_decoder_layers
-            The number of stacked Residual Blocks used in the decoder.
-        decoder_output_dim
-            The dimensionality of the decoder's output.
-        hidden_size
-            The size of the hidden layers within the encoder/decoder Residual Blocks.
-        temporal_decoder_hidden
-            The size of the hidden layers in the temporal decoder.
-        temporal_width_future
-            The dimensionality of the embedding space for future covariates.
-        temporal_hidden_size_future
-            The size of the hidden layers in the Residual Block projecting
-            future covariates.
-        use_layer_norm
-            Indicates whether to apply layer normalization in the Residual Blocks.
-        dropout
-            The dropout rate.
-
-        Inputs
-        ------
-        x
-            A tuple of Tensors (x_past, x_future, x_static)
-            where x_past represents the input/past sequence,
-            and x_future represents the output/future sequence. The input dimensions are
-            (batch_size, time_steps, components).
-        Outputs
-        -------
-        y
-            A Tensor with dimensions (batch_size, output_chunk_length, output_dim)
-            epresenting the model's output.
-        """
         super().__init__()
-
+        # save args
         self.output_dim = output_dim
         self.future_cov_dim = future_cov_dim
-        self.static_cov_dim = static_cov_dim
-        self.output_chunk_length = output_chunk_length
-        self.input_chunk_length = input_chunk_length
-        self.num_encoder_layers = num_encoder_layers
-        self.num_decoder_layers = num_decoder_layers
-        self.decoder_output_dim = decoder_output_dim
-        self.hidden_size = hidden_size
-        self.temporal_decoder_hidden = temporal_decoder_hidden
-        self.use_layer_norm = use_layer_norm
-        self.dropout = dropout
         self.temporal_width_future = temporal_width_future
-        self.temporal_hidden_size_future = temporal_hidden_size_future or hidden_size
-
-        # future covariates handling: either feature projection,
-        # raw features, or no features
-        self.future_cov_projection = None
-        if future_cov_dim > 0 and self.temporal_width_future:
-            # residual block for future covariates feature projection
-            self.future_cov_projection = _ResidualBlock(
+        self.static_cov_dim = static_cov_dim
+        self.output_chunk_length = output_chunk_length  # H
+        self.input_chunk_length = input_chunk_length    # L
+        self.hidden_size = hidden_size
+        self.embed_dim = embed_dim
+        # future cov projection
+        if future_cov_dim > 0 and temporal_width_future > 0:
+            self.future_cov_projection = _RB(
                 input_dim=future_cov_dim,
                 output_dim=temporal_width_future,
                 hidden_size=temporal_hidden_size_future,
                 use_layer_norm=use_layer_norm,
                 dropout=dropout,
             )
-            historical_future_covariates_flat_dim = (
-                self.input_chunk_length + self.output_chunk_length
-            ) * temporal_width_future
-        elif future_cov_dim > 0:
-            # skip projection and use raw features
-            historical_future_covariates_flat_dim = (
-                self.input_chunk_length + self.output_chunk_length
-            ) * future_cov_dim
+            cov_dim = temporal_width_future
         else:
-            historical_future_covariates_flat_dim = 0
-
-        encoder_dim = (
-            self.input_chunk_length * output_dim
-            + historical_future_covariates_flat_dim
-            + static_cov_dim
+            self.future_cov_projection = None
+            cov_dim = future_cov_dim
+        # encoder MLP stack
+        encoder_input_dim = (
+            input_chunk_length * output_dim +
+            (input_chunk_length + output_chunk_length) * cov_dim +
+            static_cov_dim
         )
-
-        self.encoders = nn.Sequential(
-            _ResidualBlock(
-                input_dim=encoder_dim,
+        layers = [
+            _RB(
+                input_dim=encoder_input_dim,
                 output_dim=hidden_size,
                 hidden_size=hidden_size,
                 use_layer_norm=use_layer_norm,
                 dropout=dropout,
-            ),
-            *[
-                _ResidualBlock(
-                    input_dim=hidden_size,
-                    output_dim=hidden_size,
-                    hidden_size=hidden_size,
-                    use_layer_norm=use_layer_norm,
-                    dropout=dropout,
-                )
-                for _ in range(num_encoder_layers - 1)
-            ],
-        )
-
-        self.decoders = nn.Sequential(
-            *[
-                _ResidualBlock(
-                    input_dim=hidden_size,
-                    output_dim=hidden_size,
-                    hidden_size=hidden_size,
-                    use_layer_norm=use_layer_norm,
-                    dropout=dropout,
-                )
-                for _ in range(num_decoder_layers - 1)
-            ],
-            # add decoder output layer
-            _ResidualBlock(
-                input_dim=hidden_size,
-                output_dim=decoder_output_dim * self.output_chunk_length,
-                hidden_size=hidden_size,
-                use_layer_norm=use_layer_norm,
-                dropout=dropout,
-            ),
-        )
-
-        decoder_input_dim = decoder_output_dim
-        if temporal_width_future and future_cov_dim:
-            decoder_input_dim += temporal_width_future
-        elif future_cov_dim:
-            decoder_input_dim += future_cov_dim
-
-        self.temporal_decoder = _ResidualBlock(
-            input_dim=decoder_input_dim,
-            output_dim=output_dim,
-            hidden_size=temporal_decoder_hidden,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
-        )
-
-        self.lookback_skip = nn.Linear(
-            self.input_chunk_length, self.output_chunk_length
-        )
-
-    def forward(
-        self, x_in: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
-    ) -> torch.Tensor:
-        """TiDE model forward pass.
-
-        Parameters
-        ----------
-        x_in
-            comes as tuple (x_past, x_future, x_static)
-            where x_past is the input/past chunk and x_future
-            is the output/future chunk. Input dimensions are
-            (batch_size, time_steps, components)
-        Returns
-        -------
-        torch.Tensor
-            The output Tensor of shape (batch_size, output_chunk_length, output_dim)
-        """
-
-        # x has shape (batch_size, input_chunk_length, input_dim)
-        # x_future_covariates has shape (batch_size, input_chunk_length, future_cov_dim)
-        # x_static_covariates has shape (batch_size, static_cov_dim)
-        x, x_future_covariates, x_static_covariates = x_in
-
-        x_lookback = x[:, :, : self.output_dim]
-
-        # future covariates: feature projection or raw features
-        # historical future covariates need to be extracted from x and
-        # stacked with part of future covariates
-        if self.future_cov_dim > 0:
-            x_dynamic_future_covariates = torch.cat(
-                [
-                    x[
-                        :,
-                        :,
-                        None if self.future_cov_dim == 0 else -self.future_cov_dim :,
-                    ],
-                    x_future_covariates,
-                ],
-                dim=1,
             )
-            if self.temporal_width_future:
-                # project input features across all input and output time steps
-                x_dynamic_future_covariates = self.future_cov_projection(
-                    x_dynamic_future_covariates
+        ]
+        for _ in range(num_encoder_layers - 1):
+            layers.append(
+                _RB(
+                    input_dim=hidden_size,
+                    output_dim=hidden_size,
+                    hidden_size=hidden_size,
+                    use_layer_norm=use_layer_norm,
+                    dropout=dropout,
                 )
+            )
+        self.encoder_mlp = nn.Sequential(*layers)
+        # embedding projection into per-step embeddings
+        self.embedding_head = nn.Sequential(
+            nn.Linear(hidden_size, output_chunk_length * embed_dim),
+            nn.Dropout(dropout),
+        )
+        self.layer_norm = nn.LayerNorm(embed_dim) if use_layer_norm else None
+        # positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(1, output_chunk_length, embed_dim))
+
+    def forward(self, x_in):
+        x_past, x_future_cov, x_static = x_in
+        B = x_past.size(0)
+        # slice past targets
+        x_hist = x_past[:, :, : self.output_dim]  # (B,L,output_dim)
+        # dynamic future covariates
+        if self.future_cov_dim > 0 and x_future_cov is not None:
+            hist_cov = x_past[:, :, -self.future_cov_dim:]
+            dyn = torch.cat([hist_cov, x_future_cov], dim=1)  # (B, L+H, D_f)
+            if self.future_cov_projection is not None:
+                dyn = self.future_cov_projection(dyn)         # (B,L+H,cov_dim)
         else:
-            x_dynamic_future_covariates = None
+            dyn = None
+        # flatten inputs
+        parts = [x_hist, dyn, x_static]
+        flat = [t.flatten(start_dim=1) for t in parts if t is not None]
+        enc_in = torch.cat(flat, dim=1)                    # (B, encoder_input_dim)
+        # encode
+        hidden = self.encoder_mlp(enc_in)                  # (B, hidden_size)
+        # project to sequence of embeddings
+        emb_flat = self.embedding_head(hidden)             # (B, H*embed_dim)
+        embeddings = emb_flat.view(B, self.output_chunk_length, self.embed_dim)
+        # add positional encoding
+        embeddings = embeddings + self.pos_encoding
+        if self.layer_norm is not None:
+            embeddings = self.layer_norm(embeddings)
+        return embeddings  # (B, H, embed_dim)
 
-        # setup input to encoder
-        encoded = [
-            x_lookback,
-            x_dynamic_future_covariates,
-            x_static_covariates,
-        ]
-        encoded = [t.flatten(start_dim=1) for t in encoded if t is not None]
-        encoded = torch.cat(encoded, dim=1)
 
-        # encoder, decode, reshape
-        encoded = self.encoders(encoded)
-        decoded = self.decoders(encoded)
+# Temporal Image Encoder
 
-        # get view that is batch size x output chunk length x self.decoder_output_dim
-        decoded = decoded.view(x.shape[0], self.output_chunk_length, -1)
+import math
+from math import sqrt
+import torch
+import torch.nn as nn
 
-        # stack and temporally decode with future covariate last output steps
-        temporal_decoder_input = [
-            decoded,
-            (
-                x_dynamic_future_covariates[:, -self.output_chunk_length :, :]
-                if self.future_cov_dim > 0
-                else None
+from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
+
+
+def img_to_patches(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """
+    Split an image tensor into flattened patches.
+    Args:
+        x: Tensor of shape (B, C, H, W)
+        patch_size: Size of each square patch
+    Returns:
+        Tensor of shape (B, num_patches, C * patch_size * patch_size)
+    """
+    B, C, H, W = x.shape
+    assert H % patch_size == 0 and W % patch_size == 0, \
+        "Image height and width must be divisible by patch_size"
+    h_patches = H // patch_size
+    w_patches = W // patch_size
+    # Unfold into patches: (B, C, H', W', p, p)
+    x = x.unfold(2, patch_size, patch_size).unfold(3, patch_size, patch_size)
+    # Move patch dims ahead of channels, then flatten
+    x = x.permute(0, 2, 3, 1, 4, 5).contiguous()
+    # Reshape to (B, H'*W', C * p * p)
+    x = x.view(B, h_patches * w_patches, C * patch_size * patch_size)
+    return x
+
+
+class TransformerBlock(nn.Module):
+    """
+    Single Transformer block using custom full attention and a feed-forward network.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        factor: float = None,
+    ):
+        super().__init__()
+        # Pre-norm for attention
+        self.norm1 = nn.LayerNorm(embed_dim)
+        # FullAttention backend, no causal mask for encoder
+        scale = factor or (1.0 / math.sqrt(embed_dim))
+        self.attn = AttentionLayer(
+            FullAttention(
+                mask_flag=False,
+                factor=scale,
+                attention_dropout=dropout,
+                output_attention=False,
             ),
-        ]
-        temporal_decoder_input = [t for t in temporal_decoder_input if t is not None]
+            d_model=embed_dim,
+            n_heads=num_heads,
+        )
+        # Pre-norm & feed-forward network
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout),
+        )
 
-        temporal_decoder_input = torch.cat(temporal_decoder_input, dim=2)
-        temporal_decoded = self.temporal_decoder(temporal_decoder_input)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, S, E)
+        # Multi-head attention
+        res1 = x
+        x_attn, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), attn_mask=None)
+        x = x_attn + res1
+        # Feed-forward
+        res2 = x
+        x_ff = self.ff(self.norm2(x))
+        return x_ff + res2
 
-        # pass x_lookback through self.lookback_skip but swap the last two dimensions
-        # this is needed because the skip connection is applied across
-        # the input time steps and not across the output time steps
-        skip = self.lookback_skip(x_lookback.transpose(1, 2)).transpose(1, 2)
 
-        # add skip connection
-        y = temporal_decoded + skip.reshape_as(
-            temporal_decoded
-        )  # skip.view(temporal_decoded.shape)
+class TemporalViT(nn.Module):
+    """
+    Vision Transformer for single-image encoding.
+    """
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        num_channels: int,
+        num_heads: int,
+        num_layers: int,
+        patch_size: int,
+        num_patches: int,
+        dropout: float = 0.0,
+        factor: float = None,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        # Linear project flattened patches to embed_dim
+        self.input_proj = nn.Linear(num_channels * patch_size * patch_size, embed_dim)
+        # Class token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        # Positional and temporal embeddings for cls + patches
+        total_tokens = 1 + num_patches
+        self.pos_embedding = nn.Parameter(torch.randn(1, total_tokens, embed_dim))
+        self.temporal_embedding = nn.Parameter(torch.randn(1, total_tokens, embed_dim))
+        # Transformer encoder
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                factor=factor,
+            )
+            for _ in range(num_layers)
+        ])
+        # Final layer norm
+        self.norm = nn.LayerNorm(embed_dim)
 
-        y = y.view(-1, self.output_chunk_length, self.output_dim)
-        return y
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Image tensor of shape (B, C, H, W)
+        Returns:
+            Tensor of shape (B, embed_dim) representing the CLS embedding
+        """
+        # 1) Patchify
+        patches = img_to_patches(x, self.patch_size)  # (B, P, C*p*p)
+        B, P, _ = patches.shape
+        # 2) Input projection
+        tokens = self.input_proj(patches)             # (B, P, E)
+        # 3) Prepend CLS token
+        cls_tokens = self.cls_token.expand(B, -1, -1) # (B, 1, E)
+        tokens = torch.cat([cls_tokens, tokens], dim=1)  # (B, 1+P, E)
+        # 4) Add positional + temporal embeddings
+        tokens = tokens + self.pos_embedding[:, : P+1, :] + self.temporal_embedding[:, : P+1, :]
+        # 5) Transformer
+        for layer in self.layers:
+            tokens = layer(tokens)
+        tokens = self.norm(tokens)
+        # Return only the CLS embedding
+        return tokens[:, 0, :]  # (B, E)
