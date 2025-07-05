@@ -14,7 +14,8 @@ from pytorch_forecasting.models.base import BaseModelWithCovariates
 from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
 
 from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
-from timage_forecasting.sub_modules import _TimeSeriesEncoder
+from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
+from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
 
 
 class Timage(BaseModelWithCovariates):
@@ -98,7 +99,7 @@ class Timage(BaseModelWithCovariates):
             x_categoricals=self.hparams.x_categoricals,
         )
 
-        self.model_img = _temporalViT(
+        self.encoder_img = _temporalViT(
             output_dim=self.output_dim,
             future_cov_dim=self.encoder_covariate_size,
             static_cov_dim=self.static_size,

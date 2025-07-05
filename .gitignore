@@ -175,3 +175,6 @@ cython_debug/
 
 notebooks/
 experiments/
+
+*.csv
+*.ipynb
