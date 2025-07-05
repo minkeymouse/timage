@@ -7,15 +7,16 @@ from typing import Optional, Union, Any
 import torch
 from torch import nn
 
-from pytorch_forecasting.data import TimeSeriesDataSet
 from pytorch_forecasting.data.encoders import NaNLabelEncoder
 from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE
 from pytorch_forecasting.models.base import BaseModelWithCovariates
 from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
-
-from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
-from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
 from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
+from mamba_ssm import Mamba2
+
+from timage_forecasting.datamodule import TimeSeriesWithImageDataSet, TimeSeriesWithImageDataModule
+from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
+
 
 
 class Timage(BaseModelWithCovariates):
@@ -93,35 +94,36 @@ class Timage(BaseModelWithCovariates):
         self.output_dim = len(self.target_names)
 
         self.embeddings = MultiEmbedding(
-            embedding_sizes=self.hparams.embedding_sizes,
-            categorical_groups=self.hparams.categorical_groups,
-            embedding_paddings=self.hparams.embedding_paddings,
-            x_categoricals=self.hparams.x_categoricals,
         )
-
-        self.encoder_img = _temporalViT(
-            output_dim=self.output_dim,
-            future_cov_dim=self.encoder_covariate_size,
-            static_cov_dim=self.static_size,
-            output_chunk_length=output_chunk_length,
-            input_chunk_length=input_chunk_length,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            decoder_output_dim=decoder_output_dim,
-            hidden_size=hidden_size,
-            temporal_decoder_hidden=temporal_decoder_hidden,
-            temporal_width_future=temporal_width_future,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
-            temporal_hidden_size_future=temporal_hidden_size_future,
-        )
-
-        self.model_ts = _SeriesEncoder(
+        self.encoder_ts = _TimeSeriesEncoder(
 
         )
 
-        self.lookback_skip = nn.Linear(
-        self.input_chunk_length, self.output_chunk_length)
+        # Output from time series encoder
+        
+        self.encoder_img = _TemporalImageEncoder(
+
+        )
+
+        # output from image encoder
+
+        self.cross_attn = AttentionLayer(
+            FullAttention(
+
+            )
+        )
+
+        # Outputs combined in the cross attention layer
+
+        self.mamba_ssm = Mamba2(
+
+        )
+
+        # Combined output go through the mamba SSM layer
+
+        self.lookback_skip = nn.Linear()
+
+        # Final layer for regression/classification
 
     def training_step(self, batch, batch_idx):
         x, (y, w) = batch
@@ -135,10 +137,6 @@ class Timage(BaseModelWithCovariates):
     
     def test_step(self, batch, batch_idx):
         return super().test_step(batch, batch_idx)
-    
-    def _vision_embedding(self, )
-        
-    def _time_series_embedding(self, )
     
     def configure_optimizers(self):
         """Configure optimizers and learning rate schedulers."""
@@ -196,58 +194,10 @@ class Timage(BaseModelWithCovariates):
             self.embeddings.output_size[name]
             for name in self.hparams.static_categoricals
         )
-
-    @classmethod
-    def from_dataset(cls, dataset: TimeSeriesDataSet, **kwargs):
-        """
-        Convenience function to create network from
-        :py:class`~pytorch_forecasting.data.timeseries.TimeSeriesDataSet`.
-
-        Args:
-            dataset (TimeSeriesDataSet): dataset where sole predictor is the target.
-            **kwargs: additional arguments to be passed to `__init__` method.
-
-        Returns:
-            TiDE
-        """
-
-        # validate arguments
-        assert not isinstance(
-            dataset.target_normalizer, NaNLabelEncoder
-        ), "only regression tasks are supported - target must not be categorical"
-
-        assert dataset.min_encoder_length == dataset.max_encoder_length, (
-            "only fixed encoder length is allowed,"
-            " but min_encoder_length != max_encoder_length"
-        )
-
-        assert dataset.max_prediction_length == dataset.min_prediction_length, (
-            "only fixed prediction length is allowed,"
-            " but max_prediction_length != min_prediction_length"
-        )
-
-        assert (
-            dataset.randomize_length is None
-        ), "length has to be fixed, but randomize_length is not None"
-        assert (
-            not dataset.add_relative_time_idx
-        ), "add_relative_time_idx has to be False"
-
-        new_kwargs = copy(kwargs)
-        new_kwargs.update(
-            {
-                "output_chunk_length": dataset.max_prediction_length,
-                "input_chunk_length": dataset.max_encoder_length,
-            }
-        )
-        new_kwargs.update(cls.deduce_default_output_parameters(dataset, kwargs, MAE()))
-        # initialize class
-        return super().from_dataset(dataset, **new_kwargs)
     
     def extract_image(self, x, img_columns):
         imgs = x["x_image"]
         return 
-
 
     def forward(self, x: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
