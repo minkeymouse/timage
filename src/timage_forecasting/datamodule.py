@@ -19,12 +19,30 @@ class TimeSeriesWithImageDataSet(TimeSeriesDataSet):
     def __init__(
         self,
         *args,
-        image_cols: List[str],
+        image_cols_start: str,
+        image_cols_end: str,
         image_shape: Tuple[int, int, int],
         **kwargs,
     ):
         # pass all the usual TS args via *args, **kwargs, plus these two
         super().__init__(*args, **kwargs)
+
+        # 1) locate the start/end positions in the self.reals list
+        if image_cols_start not in self.reals or image_cols_end not in self.reals:
+            raise ValueError(f"image_cols_start/end must be real variable names, got "
+                             f"{image_cols_start!r} or {image_cols_end!r} not in {self.reals}")
+        start_idx = self.reals.index(image_cols_start)
+        end_idx   = self.reals.index(image_cols_end)
+        if start_idx > end_idx:
+            raise ValueError(f"{image_cols_start!r} comes after {image_cols_end!r} in self.reals")
+
+        # 2) build the flattened‐image column list
+        image_cols = self.reals[start_idx : end_idx + 1]
+        assert len(image_cols) == image_shape[0] * image_shape[1] * image_shape[2], (
+            f"{len(image_cols)} pixels ≠ expected {image_shape[0]}×{image_shape[1]}×{image_shape[2]}"
+        )
+        self.image_cols = image_cols
+
         assert len(image_cols) == image_shape[0] * image_shape[1] * image_shape[2], (
             f"{len(image_cols)} != {image_shape}"
         )
@@ -67,7 +85,8 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         self,
         *,
         # image-specific:
-        image_cols: List[str],
+        image_cols_start: str,
+        image_cols_end:   str,
         image_shape: Tuple[int, int, int],
         # full & test DataFrames:
         df: pd.DataFrame,
@@ -82,12 +101,12 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         super().__init__()
         self.df           = df
         self.test_df      = test_df
-        self.image_cols   = image_cols
+        self.image_cols_start = image_cols_start
+        self.image_cols_end   = image_cols_end
         self.image_shape  = image_shape
         self.val_split    = val_split
         self.batch_size   = batch_size
         self.num_workers  = num_workers
-        # must include at least `data`, `time_idx`, `target`, `group_ids`, …
         self.ts_kwargs    = ts_kwargs
 
     def setup(self, stage: Optional[str] = None):
@@ -102,18 +121,27 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
             # override the `data=` for each
             base["data"] = df_train
             self.train_ds = TimeSeriesWithImageDataSet(
-                **base, image_cols=self.image_cols, image_shape=self.image_shape
+                **base,
+                image_cols_start=self.image_cols_start,
+                image_cols_end=self.image_cols_end,
+                image_shape=self.image_shape
             )
             base["data"] = df_val
             self.val_ds   = TimeSeriesWithImageDataSet(
-                **base, image_cols=self.image_cols, image_shape=self.image_shape
+                **base,
+                image_cols_start=self.image_cols_start,
+                image_cols_end=self.image_cols_end,
+                image_shape=self.image_shape
             )
 
         # ---- test: always build from test_df ----
         if stage in (None, "test"):
             base = {**self.ts_kwargs, "data": self.test_df}
             self.test_ds = TimeSeriesWithImageDataSet(
-                **base, image_cols=self.image_cols, image_shape=self.image_shape
+                **base,
+                image_cols_start=self.image_cols_start,
+                image_cols_end=self.image_cols_end,
+                image_shape=self.image_shape
             )
 
     def train_dataloader(self):
