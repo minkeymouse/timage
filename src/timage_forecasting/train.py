@@ -1,127 +1,155 @@
-# scripts/train.py
+# train_timage_task5.py
+
 import os
-import pathlib
-from datetime import datetime
-import argparse
+import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    EarlyStopping,
-    ModelCheckpoint,
-    LearningRateMonitor,
-)
-from pytorch_lightning.loggers import TensorBoardLogger
-from omegaconf import OmegaConf
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+import pandas as pd
 
 from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
-from timage_forecasting.model import Timage
+from timage_forecasting.models import Timage
 
 
-def get_arg_parser() -> argparse.ArgumentParser:
-    """Minimal CLI around the YAML config."""
-    p = argparse.ArgumentParser(description="Train Timage forecasting model")
-    p.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to a YAML/OMEGACONF config file",
+def main(
+    train_csv: str = "experiments/task5/train_processed_img_task5.csv",
+    test_csv: str  = "experiments/task5/test_processed_img_task5.csv",
+    output_dir: str = "lightning_logs/task5",
+    batch_size: int = 16,
+    max_encoder_length: int = 48,
+    max_prediction_length: int = 12,
+    num_encoder_layers_ts: int = 3,
+    hidden_size_ts: int = 128,
+    num_decoder_layers: int = 4,
+    decoder_output_dim: int = 128,
+    temporal_width_future: int = 8,
+    temporal_hidden_size_future: int = 64,
+    image_backbone: str = "tf_efficientnetv2_b0.in1k",
+    image_pretrained: bool = True,
+    dropout: float = 0.1,
+    learning_rate: float = 5e-4,
+    max_epochs: int = 40,
+    gpus: int = 1,
+):
+    # --- 1) load and preprocess train & test ---
+    sat_cols = [f"sat_v{i}" for i in range(1, 576 + 1)]
+
+    def _load(path):
+        df = pd.read_csv(path, parse_dates=["date"])
+        df = df[df["panel_id"] == 0].reset_index(drop=True)
+        df[sat_cols] = df[sat_cols].fillna(method="ffill").fillna(0.0)
+        return df
+
+    df_train = _load(train_csv)
+    df_test  = _load(test_csv)
+
+    # --- 2) DataModule for train/val split ---
+    dm = TimeSeriesWithImageDataModule(
+        dataframe=df_train,
+        time_idx="time_idx",
+        target="kwh",
+        group_ids=["panel_id"],
+        static_categoricals=["panel_id"],
+        time_varying_known_reals=["solar_term", "hod", "dow", "moy", "time_idx"],
+        time_varying_unknown_reals=["kwh"],
+        image_cols=sat_cols,
+        image_shape=(1, 24, 24),
+        batch_size=batch_size,
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        num_workers=4,
+        train_fraction=0.7,
+        val_fraction=0.2,
+        shuffle=True,
     )
-    p.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume from (optional)",
+
+    # --- 3) instantiate model ---
+    model = Timage.from_dataset(
+        dm.train_dataloader().dataset,
+        input_chunk_length=max_encoder_length,
+        output_chunk_length=max_prediction_length,
+        num_encoder_layers_ts=num_encoder_layers_ts,
+        hidden_size_ts=hidden_size_ts,
+        num_decoder_layers=num_decoder_layers,
+        decoder_output_dim=decoder_output_dim,
+        temporal_width_future=temporal_width_future,
+        temporal_hidden_size_future=temporal_hidden_size_future,
+        image_backbone=image_backbone,
+        image_pretrained=image_pretrained,
+        dropout=dropout,
+        learning_rate=learning_rate,
     )
-    return p
 
-
-def init_callbacks(cfg):
-    """Lightning callbacks."""
-    ckpt_cb = ModelCheckpoint(
-        monitor=cfg.train.monitor,
-        dirpath=pathlib.Path(cfg.train.save_dir) / "checkpoints",
-        filename=f"{cfg.exp_name}" + "-{epoch:02d}-{val_loss:.4f}",
+    # --- 4) Trainer + callbacks ---
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(output_dir, "checkpoints"),
+        filename="best-{epoch:02d}-{val_loss:.4f}",
         save_top_k=1,
+        monitor="val_loss",
         mode="min",
-        auto_insert_metric_name=True,
     )
-    es_cb = EarlyStopping(
-        monitor=cfg.train.monitor,
-        mode="min",
-        patience=cfg.train.early_stop_patience,
-        verbose=True,
-    )
-    lr_cb = LearningRateMonitor(logging_interval="epoch")
-    return [ckpt_cb, es_cb, lr_cb]
+    lr_monitor = LearningRateMonitor(logging_interval="epoch")
 
-
-def main():
-    # ---- CLI & Config ----------------------------------------------------------------
-    parser = get_arg_parser()
-    args = parser.parse_args()
-
-    cfg = OmegaConf.load(args.config)  # merge CL-args if you like: OmegaConf.merge(...)
-    pl.seed_everything(cfg.train.seed, workers=True)
-
-    # ---- Loggers ---------------------------------------------------------------------
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tb_logger = TensorBoardLogger(
-        save_dir=cfg.train.save_dir,
-        name=cfg.exp_name,
-        version=run_id,
-    )
-
-    # ---- Data ------------------------------------------------------------------------
-    datamodule = TimeSeriesWithImageDataModule(
-        data_csv=cfg.data.csv_path,
-        batch_size=cfg.data.batch_size,
-        num_workers=cfg.data.num_workers,
-        input_chunk_length=cfg.data.input_chunk_length,
-        output_chunk_length=cfg.data.output_chunk_length,
-        # … any other constructor kwargs you exposed …
-    )
-
-    # ---- Model -----------------------------------------------------------------------
-    model = Timage(
-        in_img_channels=cfg.model.in_img_channels,
-        img_backbone=cfg.model.backbone,
-        ts_hidden_size=cfg.model.ts_hidden_size,
-        fusion_dim=cfg.model.fusion_dim,
-        decoder_hidden=cfg.model.decoder_hidden,
-        learning_rate=cfg.train.lr,
-        # … etc …
-    )
-
-    # ---- Callbacks -------------------------------------------------------------------
-    cbs = init_callbacks(cfg)
-
-    # ---- Trainer ---------------------------------------------------------------------
     trainer = pl.Trainer(
-        accelerator=cfg.train.accelerator,
-        devices=cfg.train.devices,
-        precision=cfg.train.precision,          # "16-mixed" for AMP
-        gradient_clip_val=cfg.train.grad_clip,  # None or float
-        accumulate_grad_batches=cfg.train.accum_grad,
-        max_epochs=cfg.train.max_epochs,
-        deterministic=True,
-        callbacks=cbs,
-        logger=tb_logger,
-        log_every_n_steps=cfg.train.log_every_n,
-        enable_progress_bar=True,
-        resume_from_checkpoint=args.resume,
+        default_root_dir=output_dir,
+        gpus=gpus if torch.cuda.is_available() and gpus > 0 else 0,
+        max_epochs=max_epochs,
+        gradient_clip_val=0.1,
+        callbacks=[checkpoint_callback, lr_monitor],
     )
 
-    # ---- Optional LR finder / tuner --------------------------------------------------
-    if cfg.train.auto_lr_find:
-        lr_finder = trainer.tuner.lr_find(model, datamodule=datamodule)
-        new_lr = lr_finder.suggestion()
-        print(f"[AutoLR] setting LR to {new_lr}")
-        model.hparams.learning_rate = new_lr
+    # --- 5) fit on train+val ---
+    trainer.fit(model, dm)
 
-    # ---- Fit / Validate / Test -------------------------------------------------------
-    trainer.fit(model=model, datamodule=datamodule)
-    trainer.validate(model=model, datamodule=datamodule, ckpt_path="best")
-    trainer.test(model=model, datamodule=datamodule, ckpt_path="best")
+    # --- 6) test on the *new* test CSV ---
+    test_dm = TimeSeriesWithImageDataModule(
+        dataframe=df_test,
+        time_idx="time_idx",
+        target="kwh",
+        group_ids=["panel_id"],
+        static_categoricals=["panel_id"],
+        time_varying_known_reals=["solar_term", "hod", "dow", "moy", "time_idx"],
+        time_varying_unknown_reals=["kwh"],
+        image_cols=sat_cols,
+        image_shape=(1, 24, 24),
+        batch_size=batch_size,
+        max_encoder_length=max_encoder_length,
+        max_prediction_length=max_prediction_length,
+        num_workers=4,
+        train_fraction=0.0,  # no train split here
+        val_fraction=0.0,
+        test_fraction=1.0,   # everything goes to test
+        shuffle=False,
+    )
+
+    trainer.test(model, datamodule=test_dm)
+    preds = trainer.predict(model, datamodule=test_dm)
+    print(f"Done. Best checkpoint: {checkpoint_callback.best_model_path}")
+    # preds is a list of batches of (B, H, 1) tensors
+    return preds
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train & test Timage on task5 (panel_id=0)")
+    parser.add_argument("--train_csv", default="experiments/task5/train_processed_img_task5.csv")
+    parser.add_argument("--test_csv",  default="experiments/task5/test_processed_img_task5.csv")
+    parser.add_argument("--output_dir", default="lightning_logs/task5")
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--max_encoder_length", type=int, default=48)
+    parser.add_argument("--max_prediction_length", type=int, default=12)
+    parser.add_argument("--num_encoder_layers_ts", type=int, default=3)
+    parser.add_argument("--hidden_size_ts", type=int, default=128)
+    parser.add_argument("--num_decoder_layers", type=int, default=4)
+    parser.add_argument("--decoder_output_dim", type=int, default=128)
+    parser.add_argument("--temporal_width_future", type=int, default=8)
+    parser.add_argument("--temporal_hidden_size_future", type=int, default=64)
+    parser.add_argument("--image_backbone", type=str, default="tf_efficientnetv2_b0.in1k")
+    parser.add_argument("--image_pretrained", action="store_true")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--max_epochs", type=int, default=40)
+    parser.add_argument("--gpus", type=int, default=1)
+
+    args = parser.parse_args()
+    main(**vars(args))
