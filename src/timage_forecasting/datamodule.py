@@ -27,6 +27,11 @@ class TimeSeriesWithImageDataSet(TimeSeriesDataSet):
         # pass all the usual TS args via *args, **kwargs, plus these two
         super().__init__(*args, **kwargs)
 
+        self.args = args
+        self.kwargs = kwargs
+        self.image_cols_start = image_cols_start
+        self.image_cols_end = image_cols_end
+
         # 1) locate the start/end positions in the self.reals list
         if image_cols_start not in self.reals or image_cols_end not in self.reals:
             raise ValueError(f"image_cols_start/end must be real variable names, got "
@@ -87,7 +92,10 @@ class TimeSeriesWithImageDataSet(TimeSeriesDataSet):
         # imgs: (B, seq_len, C, H, W)
         batch_x["x_image"] = imgs
         return batch_x, (batch_y, batch_w)
-
+    
+    def get_parameters(self) -> dict[str, Any]:
+        # Delegate to the parent so we pick up all the TS-DataSet args
+        return TimeSeriesDataSet.get_parameters(self)
 
 class TimeSeriesWithImageDataModule(LightningDataModule):
     """
@@ -140,7 +148,20 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
             df_train = df[df[time_col] <= cutoff]
             df_val   = df[df[time_col] >  cutoff]
 
-            base = dict(self.ts_kwargs)  # copy all TimeSeriesDataSet args
+            # only keep the keys that TimeSeriesDataSet actually expects
+            import inspect
+            sig = inspect.signature(TimeSeriesDataSet.__init__)
+            valid = set(sig.parameters)  # e.g. {'self','data','time_idx', ...}
+            base = { k: v for k, v in self.ts_kwargs.items() if k in valid }
+
+            # grab *all* the sat_v1…sat_v576 columns in one contiguous slice:
+            cols = list(df_train.columns)
+            start_idx = cols.index(self.image_cols_start)
+            end_idx   = cols.index(self.image_cols_end)
+            sat_cols  = cols[start_idx : end_idx + 1]
+
+            # extend the unknown_reals list so TSDataSet knows about them
+            base["time_varying_unknown_reals"] = base.get("time_varying_unknown_reals", []) + sat_cols
 
             # train set
             base["data"] = df_train

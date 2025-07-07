@@ -6,7 +6,7 @@ from typing import Optional, Union, Any, Tuple, Dict, List
 
 import torch
 from torch import nn
-from pytorch_lightning import LightningModule
+from torchmetrics import Accuracy, F1Score, AUROC, Recall
 
 from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE
 from pytorch_forecasting.models.base import BaseModelWithCovariates
@@ -41,19 +41,69 @@ class Timage(BaseModelWithCovariates):
 
         image_backbone:           str = "tf_efficientnetv2_b0.in1k",
         image_pretrained:         bool = True,
-        logging_metrics = None,
 
         # Optional parameters
         embedding_sizes:       Optional[dict[str, int]] = None,
         x_categoricals: Optional[List[str]] = None, 
         image_shape: Optional[Tuple[int, int, int]] = None,
-
+        classification: Optional[bool] = False,
+        num_classes: Optional[int] = None,
+        classification_task: Optional[str] = None,
         **kwargs
     ):
-        if logging_metrics is None:
-            logging_metrics = nn.ModuleList([SMAPE(), MAE(), RMSE(), MAPE(), MASE()])
+        super().__init__(**kwargs)
+
         self.loss = RMSE()
+        self.logging_metrics = nn.ModuleList([MAE(), MAPE(), MASE(), RMSE(), SMAPE()])
+        # finally:
+        self.save_hyperparameters(ignore=["loss","logging_metrics"])
         
+        # 1) classification branch
+        if classification:
+            if classification_task not in {"binary", "multiclass", "multilabel"}:
+                raise ValueError(f"Unsupported task {classification_task!r}")
+
+            # ensure num_classes for anything beyond binary
+            if classification_task in {"multiclass", "multilabel"} and num_classes is None:
+                raise ValueError("num_classes must be set for multiclass/multilabel")
+
+            # pick loss
+            if classification_task == "multiclass":
+                self.loss = nn.CrossEntropyLoss()
+            else:
+                # binary or multilabel
+                self.loss = nn.BCEWithLogitsLoss()
+
+            # build metrics list
+            metrics = []
+            # Accuracy
+            metrics.append(Accuracy(task=classification_task,
+                                    num_classes=num_classes))
+            # F1
+            metrics.append(F1Score(task=classification_task,
+                                   num_classes=num_classes))
+            # AUROC
+            metrics.append(AUROC(task=classification_task,
+                                 num_classes=num_classes))
+            # Recall
+            metrics.append(Recall(task=classification_task,
+                                  num_classes=num_classes))
+
+            logging_metrics = nn.ModuleList(metrics)
+
+        # 2) regression branch (unchanged)
+        else:
+            self.loss = RMSE()
+            metrics = [SMAPE(), MAE(), RMSE(), MAPE(), MASE()]
+
+        # register them as submodules
+        self.logging_metrics = nn.ModuleList(metrics)
+
+        # store flags
+        self.classification       = classification
+        self.classification_task  = classification_task
+        self.num_classes          = num_classes
+        self.decoder_output_dim = decoder_output_dim
         self.input_chunk_length = input_chunk_length
         self.output_chunk_length = output_chunk_length
         self.embedding_sizes = embedding_sizes
@@ -62,9 +112,10 @@ class Timage(BaseModelWithCovariates):
         self.output_dim = len(self.target_names)
         self.image_backbone = image_backbone
         self.image_pretrained = image_pretrained
+        self.classification = classification
 
         self.save_hyperparameters(ignore=["loss", "logging_metrics"])
-        super().__init__(logging_metrics=logging_metrics, **kwargs)
+        
 
         if self.embedding_sizes and x_categoricals is not None:
             self.embeddings = MultiEmbedding(
@@ -138,105 +189,130 @@ class Timage(BaseModelWithCovariates):
         )
         # If Decoder MLP is too big, we can change to transformer.
 
-        self.decoder_head = nn.Sequential(
-            nn.Linear(temporal_decoder_hidden, output_chunk_length * decoder_output_dim),
-            nn.Dropout(dropout),
-        )
-        self.output_layer = nn.Linear(decoder_output_dim, self.output_dim)
+        if not self.classification:
+            # regression: produce H × decoder_output_dim, then map to output_dim
+            self.decoder_head = nn.Sequential(
+                nn.Linear(temporal_decoder_hidden,
+                          output_chunk_length * decoder_output_dim),
+                nn.Dropout(dropout),
+            )
+            self.output_layer = nn.Linear(decoder_output_dim,
+                                          self.output_dim)
+        else:
+            # classification: collapse H→1 (or just ignore horizon),
+            # then produce `num_classes` logits
+            #  - if `output_chunk_length>1` you could pick the last step
+            self.classification_head = nn.Sequential(
+                # take the hidden vector (size temporal_decoder_hidden)
+                # → num_classes logits
+                nn.Linear(temporal_decoder_hidden, self.num_classes)
+            )
 
-    def training_step(self, batch: Tuple[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]], batch_idx: int):
-        # 1) unpack
+
+    def training_step(
+        self,
+        batch: Tuple[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+        batch_idx: int
+    ):
         x, (y, w) = batch
-        #   x: dict with encoder_cat, encoder_cont, decoder_cont, decoder_cat, x_image, target_scale, etc.
-        #   y: (B, H, output_dim) ground-truth
-        #   w: (B, H) optional sample weights
-
-        # 2) forward pass
         out = self(x)
-        preds = out["prediction"]                    # (B, H, output_dim)
+        preds = out["prediction"]
 
-        # 3) compute loss (weighted)
-        loss = self.loss(preds, y, w)
-        # log the raw loss
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        if self.classification:
+            # --- prepare labels and compute loss per task ---
+            if self.classification_task == "multiclass":
+                # preds: (B, C), y: (B,1) or (B,)
+                y_true = y.squeeze(-1).long()
+                loss   = self.loss(preds, y_true)
+                probs  = preds.softmax(dim=-1)
 
-        # 4) compute & log any additional metrics you configured in self.logging_metrics
-        #    each metric is a torchforecasting Metric module expecting (preds, y)
-        for metric in self.logging_metrics:
-            name = metric.__class__.__name__.lower()
-            value = metric(preds, y)
-            # log under train_<metric>, e.g. train_smape, train_mae, etc.
-            self.log(f"train_{name}", value, prog_bar=False, on_step=False, on_epoch=True)
+            elif self.classification_task == "binary":
+                # preds: (B,1), y: (B,1) or (B,)
+                logits = preds.squeeze(-1)
+                y_true = y.squeeze(-1).float()
+                loss   = self.loss(logits, y_true)
+                probs  = logits.sigmoid()
 
-        # 5) return loss so Lightning can backprop
+            else:  # multilabel
+                # preds: (B, C), y: (B, C)
+                y_true = y.float()
+                loss   = self.loss(preds, y_true)
+                probs  = preds.sigmoid()
+
+            # --- log metrics (all expect probabilities + true labels) ---
+            for metric in self.logging_metrics:
+                name = metric.__class__.__name__.lower()
+                self.log(f"train_{name}", metric(probs, y_true),
+                         on_step=False, on_epoch=True)
+
+        else:
+            # forecasting: preds (B, H, D), y (B, H, D), w (B, H)
+            loss = self.loss(preds, y, w)
+            for metric in self.logging_metrics:
+                name = metric.__class__.__name__.lower()
+                self.log(f"train_{name}", metric(preds, y),
+                         on_step=False, on_epoch=True)
+
+        # finally log loss for both modes
+        self.log("train_loss", loss,
+                 prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        # unpack
-        enc_cat  = x["encoder_cat"]   # (B, L, n_cat)
-        enc_cont = x["encoder_cont"]  # (B, L, n_real)
-        dec_cont = x["decoder_cont"]  # (B, H, n_real)
-        imgs     = x.get("x_image", None)    # optional (B, L_img, C, H, W)
+        enc_cat  = x["encoder_cat"]
+        enc_cont = x["encoder_cont"]
+        dec_cont = x["decoder_cont"]
+        imgs     = x.get("x_image", None)
         tgt_scale= x["target_scale"]
 
         B, L, _ = enc_cont.shape
-        H        = dec_cont.shape[1]
+        H       = dec_cont.shape[1]
 
-        # 1) static features = time‐zero slice of both cont & cat
-        static_cont = enc_cont[:, 0, :]       # (B, n_real)
-        static_cat  = enc_cat[:,  0, :]       # (B, n_cat)
-
-        # 2) embed cats if needed
+        # static features
+        static_cont = enc_cont[:, 0, :]
+        static_cat  = enc_cat[:,  0, :]
         if hasattr(self, "embeddings"):
-            # concatenate all cats along time, then pick time=0
-            emb_all = self.embeddings(enc_cat)    # (B, L, ∑emb_dim)
-            static_cat = emb_all[:, 0, :]          # (B, ∑emb_dim)
+            emb_all    = self.embeddings(enc_cat)
+            static_cat = emb_all[:, 0, :]
+        x_static = torch.cat([static_cont, static_cat], dim=-1)
 
-        # 3) build x_static
-        x_static = torch.cat([static_cont, static_cat], dim=-1)  # (B, D_s)
-
-        # 4) split real covariates into “target” vs “other”
-        #    past targets:
-        y_hist = enc_cont[..., self.target_positions]            # (B, L, output_dim)
-        #    past other reals:
-        mask = torch.ones(enc_cont.size(-1), dtype=torch.bool, device=enc_cont.device)
+        # split targets vs covariates
+        y_hist = enc_cont[..., self.target_positions]
+        mask   = torch.ones(enc_cont.size(-1), dtype=torch.bool, device=enc_cont.device)
         mask[self.target_positions] = False
-        cov_hist   = enc_cont[..., mask]                        # (B, L, D_f_past)
-        cov_future = dec_cont[..., mask]                        # (B, H, D_f_future)
+        cov_hist   = enc_cont[..., mask]
+        cov_future = dec_cont[..., mask]
 
-        # 5) call your TS encoder
-        ts_input = (
-            torch.cat([y_hist, cov_hist], dim=-1),  # x_past: (B, L, D_y + D_f_past)
-            cov_future,                             # x_future_cov: (B, H, D_f_future)
-            x_static                                # x_static:     (B, D_s)
-        )
-        ts_emb  = self.encoder_ts(ts_input)       # (B, L, E_ts)
+        # encode time‐series & images
+        ts_emb  = self.encoder_ts((torch.cat([y_hist, cov_hist], dim=-1), cov_future, x_static))
+        img_emb = self.encoder_img(imgs, x_static)
 
-        # 6) image pathway
-        img_emb = self.encoder_img(imgs, x_static)  # (B, L, E_ts)
+        # fuse + SSM
+        attn_out = self.cross_attn(ts_emb, img_emb, img_emb)
+        ssm_out  = self.mamba_ssm(attn_out)
 
-        # 7) cross‐attention + SSM
-        attn_out = self.cross_attn(ts_emb, img_emb, img_emb)  # (B, L, E_ts)
-        ssm_out  = self.mamba_ssm(attn_out)                   # (B, L, E_ts)
+        # decoder MLP
+        dec_emb  = torch.cat([ssm_out, ts_emb], dim=-1).view(B, -1)
+        hidden   = self.decoder_mlp(dec_emb)
 
-        # 8) decoder MLP + head
-        dec_emb   = torch.cat([ssm_out, ts_emb], dim=-1)   # (B, L, 2*E_ts)
-        dec_flat  = dec_emb.view(B, -1)                    # (B, L*2*E_ts)
-        hidden    = self.decoder_mlp(dec_flat)             # (B, temporal_decoder_hidden)
-        out_flat  = self.decoder_head(hidden)              # (B, H * decoder_output_dim)
-        out_seq   = out_flat.view(B, H, self.decoder_output_dim)
-        out_seq   = self.output_layer(out_seq)             # (B, H, output_dim)
+        if self.classification:
+            # classification head sees a single vector per sample
+            logits = self.classification_head(hidden)  # (B, num_classes)
+            return {"prediction": logits}
+        else:
+            # regression head: reshape → output_dim, add skip, un-normalize
+            out_flat = self.decoder_head(hidden)             # (B, H*decoder_output_dim)
+            out_seq  = out_flat.view(B, H, self.decoder_output_dim)
+            preds_ts = self.output_layer(out_seq)            # (B, H, output_dim)
 
-        # 9) look‐back skip
-        y_hist_flat = y_hist.reshape(B, -1)                        # (B, L*output_dim)
-        skip_flat   = self.lookback_skip(y_hist_flat)             # (B, H*output_dim)
-        skip_seq    = skip_flat.view(B, H, self.output_dim)       # (B, H, output_dim)
+            # look-back skip
+            y_hist_flat = y_hist.reshape(B, -1)
+            skip_flat   = self.lookback_skip(y_hist_flat)
+            skip_seq    = skip_flat.view(B, H, self.output_dim)
 
-        # 10) combine + un-normalize + wrap
-        preds = out_seq + skip_seq                                # (B, H, output_dim)
-        preds = self.transform_output(preds, target_scale=tgt_scale)
-        return self.to_network_output(prediction=preds)
-
+            preds = preds_ts + skip_seq
+            preds = self.transform_output(preds, target_scale=tgt_scale)
+            return self.to_network_output(prediction=preds)
 
     @classmethod
     def from_dataset(
@@ -246,7 +322,8 @@ class Timage(BaseModelWithCovariates):
     ) -> "Timage":
         """
         Build a Timage directly from a TimeSeriesWithImageDataSet, pulling in
-        all its encoding parameters automatically.
+        all its encoding parameters automatically—and if classification=True,
+        force output_chunk_length=1.
         """
         # 1) pull all TimeSeriesDataSet params
         params = dataset.get_parameters()
@@ -257,26 +334,36 @@ class Timage(BaseModelWithCovariates):
         # 3) pass through dataset params for BaseModelWithCovariates
         model_kwargs.setdefault("dataset_parameters", params)
 
-        # 4) automatically infer which features are categorical
-        #    (so MultiEmbedding can pick them up without manual x_categoricals)
-        cats = []
+        # 4) infer categoricals
+        cats: List[str] = []
         cats += params.get("static_categoricals", []) or []
         cats += params.get("time_varying_known_categoricals", []) or []
         cats += params.get("time_varying_unknown_categoricals", []) or []
         if cats:
             model_kwargs.setdefault("x_categoricals", cats)
 
-        # 5) if your DataSet carries an image_shape attr, pull it too
+        # 5) pull through image_shape if it exists on the dataset
         if hasattr(dataset, "image_shape") and dataset.image_shape is not None:
             model_kwargs.setdefault("image_shape", dataset.image_shape)
 
-        # 6) instantiate
+        # 6) enforce classification horizon = 1
+        if model_kwargs.get("classification", False):
+            specified = model_kwargs.get("output_chunk_length", None)
+            if specified is not None and specified != 1:
+                raise ValueError(
+                    f"output_chunk_length must be 1 for classification tasks, "
+                    f"but got output_chunk_length={specified}"
+                )
+            model_kwargs["output_chunk_length"] = 1
+
+        # 7) instantiate the network
         net = cls(**model_kwargs)
 
-        # 7) sanity‐check your loss matches single vs multi target
+        # 8) sanity‐check your loss matches single vs multi target
         if dataset.multi_target:
             assert isinstance(net.loss, MultiLoss), "Expected MultiLoss for multi_target"
         else:
-            assert not isinstance(net.loss, MultiLoss), "Expected single‐target loss"
+            assert not isinstance(net.loss, MultiLoss), "Expected single-target loss"
 
         return net
+

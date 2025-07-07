@@ -1,0 +1,24 @@
+# CMI sensor classification of BFRB
+path: "data/cmi.csv"
+time_idx: "timestamp"
+target: "behavior_label"
+group_ids: ["sensor_id"]
+
+# maybe static subject info
+static_reals: []
+static_categoricals: ["subject_group"]
+time_varying_known_reals: []
+time_varying_unknown_reals: []
+time_varying_known_categoricals: []
+time_varying_unknown_categoricals: []
+
+input_chunk_length: 50
+output_chunk_length: 1    # forced to 1 by from_dataset()
+
+classification: true
+num_classes: 4
+classification_task: "multiclass"
+
+image_cols_start: "pixel_000"
+image_cols_end:   "pixel_783"
+image_shape: [1,28,28]    # grayscale 28×28

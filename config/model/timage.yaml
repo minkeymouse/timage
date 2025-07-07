@@ -1,0 +1,25 @@
+# config/model/timage.yaml
+_target_: timage_forecasting.model.Timage
+
+# pull window lengths straight from the datamodule block
+input_chunk_length:  ${datamodule.max_encoder_length}
+output_chunk_length: ${datamodule.max_prediction_length}
+
+# core encoder/decoder sizes
+num_encoder_layers_ts:      3
+hidden_size_ts:            64
+num_decoder_layers:        2
+decoder_output_dim:        16
+
+# TiDe-style future covariate settings
+temporal_width_future:     4
+temporal_hidden_size_future: 32
+temporal_decoder_hidden:   32
+
+use_layer_norm:            false
+dropout:                   0.1
+
+# image-encoder backbone
+image_backbone:           "tf_efficientnetv2_b0.in1k"
+image_pretrained:         true
+

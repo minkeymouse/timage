@@ -1,0 +1,60 @@
+version_base: 1.1
+experiment:
+  seed: 42
+datamodule:
+  _target_: timage_forecasting.datamodule.TimeSeriesWithImageDataModule
+  df_path: experiments/task5/train_processed_img_task5.csv
+  test_df_path: experiments/task5/test_processed_img_task5.csv
+  keep_ids:
+  - 0
+  - 1
+  parse_dates:
+  - date
+  val_split: 0.2
+  batch_size: 32
+  num_workers: 4
+  time_idx: time_idx
+  target: kwh
+  group_ids:
+  - panel_id
+  static_reals: []
+  static_categoricals:
+  - solar_term
+  - hod
+  - dow
+  - moy
+  time_varying_known_reals: []
+  time_varying_unknown_reals:
+  - kwh
+  time_varying_known_categoricals: []
+  time_varying_unknown_categoricals: []
+  image_cols_start: sat_v1
+  image_cols_end: sat_v576
+  image_shape:
+  - 1
+  - 24
+  - 24
+  max_encoder_length: 168
+  max_prediction_length: 24
+model:
+  _target_: timage_forecasting.model.Timage
+  input_chunk_length: ${datamodule.max_encoder_length}
+  output_chunk_length: ${datamodule.max_prediction_length}
+  num_encoder_layers_ts: 3
+  hidden_size_ts: 64
+  num_decoder_layers: 2
+  decoder_output_dim: 16
+  temporal_width_future: 4
+  temporal_hidden_size_future: 32
+  temporal_decoder_hidden: 32
+  use_layer_norm: false
+  dropout: 0.1
+  image_backbone: tf_efficientnetv2_b0.in1k
+  image_pretrained: true
+trainer:
+  _target_: pytorch_lightning.Trainer
+  max_epochs: 100
+  gpus: 1
+  precision: 16
+  log_every_n_steps: 10
+  default_root_dir: lightning_logs

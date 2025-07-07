@@ -1,105 +1,61 @@
-#!/usr/bin/env python
-import os
-import sys
-import torch
+# src/timage_forecasting/train.py
+import pandas as pd
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pandas import read_csv
-
-# ensure src/ is on PYTHONPATH
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import hydra
+from omegaconf import OmegaConf, DictConfig
 
 from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
+import inspect
+from pytorch_forecasting import TimeSeriesDataSet
+print(inspect.signature(TimeSeriesDataSet.__init__))
 from timage_forecasting.model import Timage
 
-def main():
-    data_dir   = "experiments/task5"
-    train_path = os.path.join(data_dir, "train_processed_img_task5.csv")
-    test_path  = os.path.join(data_dir, "test_processed_img_task5.csv")
+@hydra.main(config_path="../../config", config_name="config")
+def main(cfg: DictConfig):
+    # 1) reproducibility
+    print("––––––––– cfg.datamodule –––––––––")
+    print(OmegaConf.to_yaml(cfg.datamodule))
+    pl.seed_everything(cfg.experiment.seed, workers=True)
 
-    # 1) Load & filter to panel_id == 0
-    df      = read_csv(train_path, parse_dates=["date"])
-    test_df = read_csv(test_path,  parse_dates=["date"])
-    df      = df[df.panel_id == 0].reset_index(drop=True)
-    test_df = test_df[test_df.panel_id == 0].reset_index(drop=True)
+    # 2) load your data, casting parse_dates to a list
+    parse_dates = list(cfg.datamodule.parse_dates)
+    df      = pd.read_csv(cfg.datamodule.df_path,      parse_dates=parse_dates)
+    test_df = pd.read_csv(cfg.datamodule.test_df_path, parse_dates=parse_dates)
 
-    # 2) Cast known categoricals to strings
-    cats = ["solar_term", "hod", "dow", "moy"]
-    for col in cats:
+    # 2a) cast all declared categorical columns to string
+    cat_cols = (
+        cfg.datamodule.static_categoricals
+        + cfg.datamodule.time_varying_known_categoricals
+        + cfg.datamodule.time_varying_unknown_categoricals
+    )
+    for col in cat_cols:
         df[col]      = df[col].astype(str)
         test_df[col] = test_df[col].astype(str)
 
-    # 3) Define image columns & fill NaNs everywhere
-    image_cols = [f"sat_v{i}" for i in range(1, 577)]
-    # — target
-    df["kwh"]      = df["kwh"].fillna(0.0)
-    test_df["kwh"] = test_df["kwh"].fillna(0.0)
-    # — image bands
-    df[image_cols]      = df[image_cols].fillna(0.0)
-    test_df[image_cols] = test_df[image_cols].fillna(0.0)
+    # 3) filter to only the panels you care about
+    keep_ids = list(cfg.datamodule.keep_ids)
+    df      = df     [df    .panel_id.isin(keep_ids)].reset_index(drop=True)
+    test_df = test_df[test_df.panel_id.isin(keep_ids)].reset_index(drop=True)
 
-    # 4) Shared TimeSeriesDataSet settings
-    ts_kwargs = dict(
-        time_idx="time_idx",
-        target="kwh",
-        group_ids=["panel_id"],
-        static_categoricals=[],
-        time_varying_known_reals=["time_idx"],
-        time_varying_known_categoricals=cats,
-        time_varying_unknown_reals=image_cols,
-        max_encoder_length=24,
-        max_prediction_length=24,
-        allow_missing_timesteps=True,
-    )
-
-    # 5) Build the LightningDataModule
-    dm = TimeSeriesWithImageDataModule(
+    # 4) instantiate your LightningDataModule
+    datamodule = hydra.utils.instantiate(
+        cfg.datamodule,
         df=df,
         test_df=test_df,
-        image_cols_start="sat_v1",
-        image_cols_end="sat_v576",
-        image_shape=(1, 24, 24),
-        batch_size=64,
-        num_workers=4,
-        val_split=0.2,
-        **ts_kwargs,
+        _recursive_=False,
     )
+    datamodule.setup(stage="fit")
 
-    # 6) Fit datamodule to get train_ds & its fitted scalers/params
-    dm.setup(stage="fit")
-    train_ds  = dm.train_ds
-    ds_params = train_ds.get_parameters()    # all TimeSeriesDataSet args
-    scaler    = train_ds.target_normalizer   # fitted target scaler
+    # 4) instantiate Timage via from_dataset (so BaseModelWithCovariates.__init__ runs cleanly)
+    #    filter out the _target_ key so we only pass real hyperparameters
+    model_kwargs = { k: v for k, v in cfg.model.items() if k != "_target_" }
+    model = Timage.from_dataset(datamodule.train_ds, **model_kwargs)
+    # 6) instantiate your Trainer
+    trainer = hydra.utils.instantiate(cfg.trainer)
 
-    # 7) Instantiate model DIRECTLY
-    model = Timage(
-        # architecture params
-        input_chunk_length=24,
-        output_chunk_length=24,
-        num_encoder_layers_ts=2,
-        hidden_size_ts=64,
-        num_decoder_layers=2,
-        decoder_output_dim=32,
-        image_backbone="tf_efficientnetv2_b0.in1k",
-        image_pretrained=True,
-        # dataset / scaling
-        dataset_parameters=ds_params,
-        output_transformer=scaler,
-    )
-
-    # 8) Trainer + checkpoint callback
-    ckpt    = ModelCheckpoint(monitor="val_loss", save_top_k=1)
-    devices = 1 if torch.cuda.is_available() else None
-    trainer = pl.Trainer(
-        max_epochs=10,
-        accelerator="auto",
-        devices=devices,
-        callbacks=[ckpt],
-    )
-
-    # 9) Run training
-    trainer.fit(model, datamodule=dm)
-
+    # 7) fit + test
+    trainer.fit(model, datamodule=datamodule)
+    trainer.test(model, datamodule=datamodule)
 
 if __name__ == "__main__":
     main()
