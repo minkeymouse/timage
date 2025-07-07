@@ -57,12 +57,27 @@ class TimeSeriesWithImageDataSet(TimeSeriesDataSet):
 
     def __getitem__(self, idx) -> Tuple[Dict[str, torch.Tensor], Any]:
         x, (y, w) = super().__getitem__(idx)
-        cont = x["x_cont"]                      # (seq_len, D)
+
+        enc = x["encoder_cont"]   # (L, D)
+        dec = x["decoder_cont"]    # (H, D)
+        cont = torch.cat([enc, dec], dim=0)       # (L+H, D)
+
         flat = cont[:, self._image_idx]         # (seq_len, N)
-        x["x_cont"] = cont[:, self._keep_mask]  # (seq_len, D-N)
+        cont = cont[:, self._keep_mask]  # (seq_len, D-N)
         C, H, W = self.image_shape
-        L = flat.size(0)
-        x["x_image"] = flat.view(L, C, H, W)    # (seq_len, C, H, W)
+
+        # split back into history vs forecast
+        L_hist, H_horiz = enc.size(0), dec.size(0)
+    
+        # encoder_cont ← first L_hist columns of cont
+        x["encoder_cont"] = cont[:L_hist]
+        # decoder_cont ← next H_horiz columns of cont
+        x["decoder_cont"] = cont[L_hist : L_hist + H_horiz]
+    
+        # image only over the history window
+        img_flat = flat[:L_hist]                   # (L_hist, N)
+        x["x_image"] = img_flat.view(L_hist, C, H, W)
+
         return x, (y, w)
 
     @staticmethod
@@ -110,38 +125,48 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         self.ts_kwargs    = ts_kwargs
 
     def setup(self, stage: Optional[str] = None):
-        # ---- fit: carve train / val out of self.df ----
-        if stage in (None, "fit"):
-            # simple random split of the rows (you could also do time-based)
-            frac_train = 1.0 - self.val_split
-            df_train = self.df.sample(frac=frac_train, random_state=0)
-            df_val   = self.df.drop(df_train.index)
+        # which column encodes time?
+        time_col = self.ts_kwargs["time_idx"]  
+        df = self.df
 
-            base = {**self.ts_kwargs}
-            # override the `data=` for each
+        # compute the cutoff timestamp / index
+        vals = df[time_col].unique()
+        # if datetime, sort by timestamp; else sort numerically
+        vals = sorted(vals)
+        cutoff = vals[int(len(vals) * (1.0 - self.val_split))]
+
+        if stage in (None, "fit"):
+            # time‐based split
+            df_train = df[df[time_col] <= cutoff]
+            df_val   = df[df[time_col] >  cutoff]
+
+            base = dict(self.ts_kwargs)  # copy all TimeSeriesDataSet args
+
+            # train set
             base["data"] = df_train
             self.train_ds = TimeSeriesWithImageDataSet(
                 **base,
                 image_cols_start=self.image_cols_start,
                 image_cols_end=self.image_cols_end,
-                image_shape=self.image_shape
+                image_shape=self.image_shape,
             )
+
+            # val set
             base["data"] = df_val
             self.val_ds   = TimeSeriesWithImageDataSet(
                 **base,
                 image_cols_start=self.image_cols_start,
                 image_cols_end=self.image_cols_end,
-                image_shape=self.image_shape
+                image_shape=self.image_shape,
             )
 
-        # ---- test: always build from test_df ----
         if stage in (None, "test"):
             base = {**self.ts_kwargs, "data": self.test_df}
             self.test_ds = TimeSeriesWithImageDataSet(
                 **base,
                 image_cols_start=self.image_cols_start,
                 image_cols_end=self.image_cols_end,
-                image_shape=self.image_shape
+                image_shape=self.image_shape,
             )
 
     def train_dataloader(self):

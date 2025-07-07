@@ -2,31 +2,35 @@
 name = "timage-forecasting"
 version = "0.1.0"
 description = "multi-modal time series forecasting with image data"
-authors = [
-    {name = "minkeymouse",email = "minkey.chang@gmail.com"}
-]
-license = {text = "MIT"}
 readme = "README.md"
+license = {text = "MIT"}
+authors = [
+  {name = "minkeymouse", email = "minkey.chang@gmail.com"}
+]
 requires-python = ">=3.11,<3.14"
-dependencies = [
-    "triton (>=3.3.1,<4.0.0)",
-    "numpy (>=2.3.1,<3.0.0)",
-    "pandas (>=2.3.0,<3.0.0)",
-    "torch (>=2.7.1,<3.0.0)",
-    "torchvision (>=0.22.1,<0.23.0)",
-    "torchaudio (>=2.7.1,<3.0.0)",
-    "pytorch-forecasting (>=1.4.0,<2.0.0)",
-    "transformers (>=4.53.0,<5.0.0)",
-    "timm (>=1.0.16,<2.0.0)"
+
+packages = [
+  { include = "timage_forecasting", from = "src" }
 ]
 
 [tool.poetry.dependencies]
-mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "v2.2.4" }
+python = ">=3.11,<3.14"
+triton = ">=3.3.1,<4.0.0"
+numpy = ">=2.3.1,<3.0.0"
+pandas = ">=2.3.0,<3.0.0"
+torch = ">=2.7.1,<3.0.0"
+torchvision = ">=0.22.1,<0.23.0"
+torchaudio = ">=2.7.1,<3.0.0"
+pytorch-forecasting = ">=1.4.0,<2.0.0"
+transformers = ">=4.53.0,<5.0.0"
+timm = ">=1.0.16,<2.0.0"
 
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+# your git dependency
+mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "v2.2.4" }
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.1"
 
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

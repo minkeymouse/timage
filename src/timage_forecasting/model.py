@@ -52,8 +52,7 @@ class Timage(BaseModelWithCovariates):
     ):
         if logging_metrics is None:
             logging_metrics = nn.ModuleList([SMAPE(), MAE(), RMSE(), MAPE(), MASE()])
-        if self.loss is None:
-            self.loss = RMSE()
+        self.loss = RMSE()
         
         self.input_chunk_length = input_chunk_length
         self.output_chunk_length = output_chunk_length
@@ -137,6 +136,8 @@ class Timage(BaseModelWithCovariates):
                 for _ in range(num_decoder_layers - 1)
             ]
         )
+        # If Decoder MLP is too big, we can change to transformer.
+
         self.decoder_head = nn.Sequential(
             nn.Linear(temporal_decoder_hidden, output_chunk_length * decoder_output_dim),
             nn.Dropout(dropout),

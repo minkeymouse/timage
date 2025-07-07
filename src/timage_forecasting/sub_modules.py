@@ -106,11 +106,16 @@ class _TimeSeriesEncoder(nn.Module):
         x_hist = x_past[:, :L, :self.output_dim]          # (B, L, D_y)
 
         # b) build dyn covs = last-L past covs  +  H future covs
-        if self.future_cov_projection or self.future_cov_dim>0:
+        has_future = self.future_cov_dim > 0
+        if has_future and self.future_cov_projection is not None:
             hist_cov = x_past[:, :L, -self.future_cov_dim:]  # (B, L, D_f)
             dyn = torch.cat([hist_cov, x_future_cov], dim=1)  # (B, L+H, D_f)
             if self.future_cov_projection:
                 dyn = self.future_cov_projection(dyn)         # (B, L+H, cov_dim)
+        elif has_future:
+            # just concatenate without projection
+            hist_cov = x_past[:, :L, -self.future_cov_dim:]
+            dyn = torch.cat([hist_cov, x_future_cov], dim=1)
         else:
             dyn = None
 
@@ -146,12 +151,14 @@ class _TemporalImageEncoder(nn.Module):
         in_chans: int = 1,
         backbone_name: str = "tf_efficientnetv2_b0.in1k",
         pretrained: bool = True,
+        train_backbone: bool = True,
         use_layer_norm: bool = False,
         dropout: float = 0.1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.input_chunk_length = input_chunk_length
+        self.train_backbone = train_backbone
 
         # 1) spatial backbone → global max pool → (B*L, feat_ch)
         self.backbone = timm.create_model(
@@ -200,6 +207,9 @@ class _TemporalImageEncoder(nn.Module):
             f"Expected {self.input_chunk_length} frames, got {L}"
         )
 
+        if not self.train_backbone:
+            for p in self.backbone.parameters(): p.requires_grad = False
+
         # run all frames through the CNN backbone at once
         frames = x_img.view(B * L, C, H, W)   # (B*L, C, H, W)
         feats = self.backbone(frames)         # (B*L, feat_ch)
@@ -217,8 +227,10 @@ class _TemporalImageEncoder(nn.Module):
         gate = gate.sigmoid().unsqueeze(1)           # (B, 1, E)
         shift = shift.unsqueeze(1)                   # (B, 1, E)
 
-        enriched = embs * gate + shift               # (B, L, E)
-        out = embs + enriched                        # residual skip
+        # enriched = embs * gate + shift               # (B, L, E)
+        # out = embs + enriched                        # residual skip
+
+        out = embs * gate + shift
 
         return out  # (B, L, E)
 
