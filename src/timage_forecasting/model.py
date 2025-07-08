@@ -17,7 +17,7 @@ from pytorch_forecasting.metrics import MultiLoss
 
 from mamba_ssm import Mamba2
 
-from timage_forecasting.datamodule import TimeSeriesWithImageDataSet
+from timage_forecasting.dataset import TimeSeriesWithImageDataSet
 from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
 
 class Timage(BaseModelWithCovariates):
@@ -325,7 +325,7 @@ class Timage(BaseModelWithCovariates):
         all its encoding parameters automatically—and if classification=True,
         force output_chunk_length=1.
         """
-        # 1) pull all TimeSeriesDataSet params
+        # 1) pull all TimeSeriesWithImageDataSet params
         params = dataset.get_parameters()
 
         # 2) ensure we use the same target scaler

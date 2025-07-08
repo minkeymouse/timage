@@ -6,9 +6,12 @@ hydra:
 
 defaults:
   - _self_
-  - datamodule: solar
-  - model:      timage
-  - trainer:    default
+  - dataset: solar
+  - model: timage
+  - trainer: default
 
 experiment:
   seed: 42
+  cutoff: 0.2
+  batch_size: 64
+  num_worker: 4

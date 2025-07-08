@@ -1,61 +1,69 @@
 # src/timage_forecasting/train.py
 import pandas as pd
 import pytorch_lightning as pl
+from torch.utils.data import DataLoader
 import hydra
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import DictConfig
 
-from timage_forecasting.datamodule import TimeSeriesWithImageDataModule
-import inspect
-from pytorch_forecasting import TimeSeriesDataSet
-print(inspect.signature(TimeSeriesDataSet.__init__))
+from timage_forecasting.dataset import TimeSeriesWithImageDataSet
 from timage_forecasting.model import Timage
 
 @hydra.main(config_path="../../config", config_name="config")
 def main(cfg: DictConfig):
-    # 1) reproducibility
-    print("––––––––– cfg.datamodule –––––––––")
-    print(OmegaConf.to_yaml(cfg.datamodule))
+    # reproducibility
     pl.seed_everything(cfg.experiment.seed, workers=True)
 
-    # 2) load your data, casting parse_dates to a list
-    parse_dates = list(cfg.datamodule.parse_dates)
-    df      = pd.read_csv(cfg.datamodule.df_path,      parse_dates=parse_dates)
-    test_df = pd.read_csv(cfg.datamodule.test_df_path, parse_dates=parse_dates)
+    # 1) load & split your CSVs
+    df       = pd.read_csv(cfg.dataset.df_path,       parse_dates=["date"])
+    test_df  = pd.read_csv(cfg.dataset.test_df_path,  parse_dates=["date"])
+    cutoff   = int(df["timd_idx"].max() * (1.0 - cfg.experiment.cutoff))
+    train_df = df[df["timd_idx"] <= cutoff]
+    val_df   = df[df["timd_idx"] >  cutoff]
 
-    # 2a) cast all declared categorical columns to string
-    cat_cols = (
-        cfg.datamodule.static_categoricals
-        + cfg.datamodule.time_varying_known_categoricals
-        + cfg.datamodule.time_varying_unknown_categoricals
+    # 2) instantiate your TimeSeriesWithImageDataSet via Hydra
+    train_ds = hydra.utils.instantiate(cfg.dataset, df=train_df)
+    val_ds   = hydra.utils.instantiate(cfg.dataset, df=val_df)
+    test_ds  = hydra.utils.instantiate(cfg.dataset, df=test_df)
+
+    # 3) wrap them in DataLoaders using to_dataloader()
+    train_loader = train_ds.to_dataloader(
+        train=True,
+        batch_size   = cfg.experiment.batch_size,
+        shuffle      = True,
+        num_workers  = cfg.experiment.num_workers,
+        collate_fn   = train_ds._collate_fn,
     )
-    for col in cat_cols:
-        df[col]      = df[col].astype(str)
-        test_df[col] = test_df[col].astype(str)
-
-    # 3) filter to only the panels you care about
-    keep_ids = list(cfg.datamodule.keep_ids)
-    df      = df     [df    .panel_id.isin(keep_ids)].reset_index(drop=True)
-    test_df = test_df[test_df.panel_id.isin(keep_ids)].reset_index(drop=True)
-
-    # 4) instantiate your LightningDataModule
-    datamodule = hydra.utils.instantiate(
-        cfg.datamodule,
-        df=df,
-        test_df=test_df,
-        _recursive_=False,
+    val_loader = val_ds.to_dataloader(
+        train=False,
+        batch_size   = cfg.experiment.batch_size,
+        shuffle      = False,
+        num_workers  = cfg.experiment.num_workers,
+        collate_fn   = val_ds._collate_fn,
     )
-    datamodule.setup(stage="fit")
+    test_loader = test_ds.to_dataloader(
+        train=False,
+        batch_size   = cfg.experiment.batch_size,
+        shuffle      = False,
+        num_workers  = cfg.experiment.num_workers,
+        collate_fn   = test_ds._collate_fn,
+    )
 
-    # 4) instantiate Timage via from_dataset (so BaseModelWithCovariates.__init__ runs cleanly)
-    #    filter out the _target_ key so we only pass real hyperparameters
-    model_kwargs = { k: v for k, v in cfg.model.items() if k != "_target_" }
-    model = Timage.from_dataset(datamodule.train_ds, **model_kwargs)
-    # 6) instantiate your Trainer
+    # 4) instantiate model & trainer via Hydra
+    model   = hydra.utils.instantiate(cfg.model,   dataset=train_ds)
     trainer = hydra.utils.instantiate(cfg.trainer)
 
-    # 7) fit + test
-    trainer.fit(model, datamodule=datamodule)
-    trainer.test(model, datamodule=datamodule)
+    # 5) train + validate
+    trainer.fit(
+        model,
+        train_dataloaders = train_loader,
+        val_dataloaders   = val_loader,
+    )
+
+    # 6) final test
+    trainer.test(
+        model,
+        test_dataloaders = test_loader,
+    )
 
 if __name__ == "__main__":
     main()
