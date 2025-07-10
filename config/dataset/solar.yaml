@@ -1,16 +1,12 @@
-_target_: timage_forecasting.datamodule.TimeSeriesWithImageDataSet
-
-# ── DataModule-only ───────────────────────────────
-df_path:       "experiments/task5/train_processed_img_task5.csv"
-test_df_path:  "experiments/task5/test_processed_img_task5.csv"
+_target_: timage_forecasting.dataset.TimeSeriesWithImageDataSet
 
 # ── TimeSeriesWithImageDataSet ───────────────────
-time_idx:      time_idx
-target:        kwh
-group_ids:    [panel_id]
+time_idx: "time_idx"
+target: "kwh"
+group_ids: ["panel_id"]
 
-static_categoricals: [solar_term, hod, dow, moy]
-static_reals:        []
+static_categoricals: []
+static_reals:        [solar_term, hod, dow, moy]
 
 time_varying_known_categoricals:   []
 time_varying_known_reals:          []
@@ -21,11 +17,11 @@ lags:
   kwh: [1]
 
 allow_missing_timesteps: true      # set false if no gaps
-add_target_scales:      true
-add_relative_time_idx:  false
-add_encoder_length:     false
-randomize_length:       false
-weight:                 null       # no weighting
+add_target_scales: true
+add_relative_time_idx: false
+add_encoder_length: false
+randomize_length: false
+weight: null       # no weighting
 
 target_normalizer:      auto
 

@@ -178,3 +178,7 @@ experiments/
 
 *.csv
 *.ipynb
+
+config/
+
+*.yaml

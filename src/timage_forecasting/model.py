@@ -1,62 +1,62 @@
 """
 Timage for image integrated time series forecasting.
 """
-from copy import copy
-from typing import Optional, Union, Any, Tuple, Dict, List
+from typing import Optional, Any, Tuple, Dict, List
 
 import torch
 from torch import nn
-from torchmetrics import Accuracy, F1Score, AUROC, Recall
+from torchmetrics import Accuracy
 
 from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE
-from pytorch_forecasting.models.base import BaseModelWithCovariates
+from pytorch_forecasting.models.base import BaseModel, BaseModelWithCovariates
 from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
 from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock
 from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
-from pytorch_forecasting.metrics import MultiLoss
-
-from mamba_ssm import Mamba2
 
 from timage_forecasting.dataset import TimeSeriesWithImageDataSet
 from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
+
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names, but StandardScaler was fitted with feature names",
+    category=UserWarning,
+    module="sklearn.utils.validation",
+)
 
 class Timage(BaseModelWithCovariates):
     """Image integrated time series model for long-term forecasting."""
     def __init__(
         self,
-        input_chunk_length: int,
-        output_chunk_length: int,
+        dataset_parameters: Dict[str, Any],
+        output_transformer: Any,
+
+        image_cols_start: str,
+        image_cols_end:   str,
+        image_shape:      Tuple[int,int,int],
 
         num_encoder_layers_ts: int,       # how many layers in your TS encoder
         hidden_size_ts:           int,       # embedding / hidden size of TS encoder
         num_decoder_layers:       int,       # number of residual blocks in decoder
         decoder_output_dim:       int,       # width of the decoder MLP’s output before final projection
-
         temporal_width_future:    int = 4,   # how many future steps your TS encoder “sees” internally
         temporal_hidden_size_future: int = 32, 
         temporal_decoder_hidden:  int = 32,  # hidden size inside each decoder block
-
         use_layer_norm:           bool = False,
         dropout:                  float = 0.1,
-
         image_backbone:           str = "tf_efficientnetv2_b0.in1k",
         image_pretrained:         bool = True,
-
-        # Optional parameters
         embedding_sizes:       Optional[dict[str, int]] = None,
         x_categoricals: Optional[List[str]] = None, 
-        image_shape: Optional[Tuple[int, int, int]] = None,
         classification: Optional[bool] = False,
         num_classes: Optional[int] = None,
         classification_task: Optional[str] = None,
         **kwargs
     ):
-        super().__init__(**kwargs)
-
-        self.loss = RMSE()
-        self.logging_metrics = nn.ModuleList([MAE(), MAPE(), MASE(), RMSE(), SMAPE()])
-        # finally:
-        self.save_hyperparameters(ignore=["loss","logging_metrics"])
+        super().__init__(
+            dataset_parameters = dataset_parameters,
+            output_transformer = output_transformer,
+            **{})
         
         # 1) classification branch
         if classification:
@@ -79,19 +79,7 @@ class Timage(BaseModelWithCovariates):
             # Accuracy
             metrics.append(Accuracy(task=classification_task,
                                     num_classes=num_classes))
-            # F1
-            metrics.append(F1Score(task=classification_task,
-                                   num_classes=num_classes))
-            # AUROC
-            metrics.append(AUROC(task=classification_task,
-                                 num_classes=num_classes))
-            # Recall
-            metrics.append(Recall(task=classification_task,
-                                  num_classes=num_classes))
-
-            logging_metrics = nn.ModuleList(metrics)
-
-        # 2) regression branch (unchanged)
+            
         else:
             self.loss = RMSE()
             metrics = [SMAPE(), MAE(), RMSE(), MAPE(), MASE()]
@@ -99,32 +87,55 @@ class Timage(BaseModelWithCovariates):
         # register them as submodules
         self.logging_metrics = nn.ModuleList(metrics)
 
-        # store flags
-        self.classification       = classification
-        self.classification_task  = classification_task
-        self.num_classes          = num_classes
+        # store 
+        self.dataset_parameters = dataset_parameters
+        self.output_dim = len(dataset_parameters["target"])
+        self.input_chunk_length = dataset_parameters["max_encoder_length"]
+        self.output_chunk_length = dataset_parameters["max_prediction_length"]
+
+        self.num_encoder_layers_ts = num_encoder_layers_ts
+        self.hidden_size_ts = hidden_size_ts
+        self.num_decoder_layers = num_decoder_layers
         self.decoder_output_dim = decoder_output_dim
-        self.input_chunk_length = input_chunk_length
-        self.output_chunk_length = output_chunk_length
-        self.embedding_sizes = embedding_sizes
-        self.x_categoricals = x_categoricals
-        self.image_shape = image_shape
-        self.output_dim = len(self.target_names)
+
+
+        self.temporal_width_future = temporal_width_future
+        self.temporal_hidden_size_future = temporal_hidden_size_future
+        self.temporal_decoder_hidden = temporal_decoder_hidden
+
+
+        self.use_layer_norm = use_layer_norm
+        self.dropout = dropout
         self.image_backbone = image_backbone
         self.image_pretrained = image_pretrained
+        self.image_cols_start = image_cols_start
+        self.image_cols_end   = image_cols_end
+        self.image_shape      = image_shape
+
+        self.embedding_sizes = embedding_sizes
+
+        # Categoricals
+        self.x_categoricals = x_categoricals
         self.classification = classification
+        self.num_classes = num_classes
+        self.classification_task = classification_task
 
         self.save_hyperparameters(ignore=["loss", "logging_metrics"])
         
-
-        if self.embedding_sizes and x_categoricals is not None:
+        if self.embedding_sizes and self.x_categoricals is not None:
             self.embeddings = MultiEmbedding(
                 embedding_sizes=self.embedding_sizes,
-                x_categoricals=x_categoricals,
+                x_categoricals=self.x_categoricals,
             )
 
         static_cov_dim = len(self.static_variables)
-        future_cov_dim = len(self.decoder_variables)
+        
+        # how many real + categorical covariates you actually feed
+        cont_dim = len(dataset_parameters["time_varying_unknown_reals"]) \
+                 + len(dataset_parameters["time_varying_known_reals"])
+        cat_dim  = len(dataset_parameters["time_varying_unknown_categoricals"]) \
+                 + len(dataset_parameters["time_varying_known_categoricals"])
+        future_cov_dim = cont_dim + cat_dim
 
         self.encoder_ts = _TimeSeriesEncoder(
             output_dim=self.output_dim,
@@ -145,7 +156,7 @@ class Timage(BaseModelWithCovariates):
         self.encoder_img = _TemporalImageEncoder(
             embed_dim=hidden_size_ts,
             static_cov_dim=static_cov_dim,
-            input_chunk_length=input_chunk_length,
+            input_chunk_length=self.input_chunk_length,
             backbone_name = self.image_backbone,
             pretrained = self.image_pretrained,
             in_chans=in_channels,
@@ -161,19 +172,23 @@ class Timage(BaseModelWithCovariates):
             n_heads=n_heads,
         )
 
-        self.mamba_ssm = Mamba2(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size_ts,
-            headdim=4,   # number of heads (for internal multi-head processing)
-            d_state=64,  # state dimension
-            d_conv=4,    # convolutional expansion dimension
-            expand=2,    # expansion factor in transition
+            nhead=8,
+            dim_feedforward=hidden_size_ts * 4,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.state_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=2,
         )
 
         # Linear layer for lookback skip connection (maps past target sequence to forecast)
-        self.lookback_skip = nn.Linear(input_chunk_length * self.output_dim, output_chunk_length * self.output_dim)
+        self.lookback_skip = nn.Linear(self.input_chunk_length * self.output_dim, self.output_chunk_length * self.output_dim)
 
         self.decoder_mlp = nn.Sequential(
-            _ResidualBlock(input_dim=input_chunk_length * 2*hidden_size_ts,  # because we concat SSM + TS
+            _ResidualBlock(input_dim=self.input_chunk_length * 2*hidden_size_ts,  # because we concat SSM + TS
                         output_dim=temporal_decoder_hidden,
                         hidden_size=temporal_decoder_hidden,
                         use_layer_norm=use_layer_norm,
@@ -193,7 +208,7 @@ class Timage(BaseModelWithCovariates):
             # regression: produce H × decoder_output_dim, then map to output_dim
             self.decoder_head = nn.Sequential(
                 nn.Linear(temporal_decoder_hidden,
-                          output_chunk_length * decoder_output_dim),
+                          self.output_chunk_length * decoder_output_dim),
                 nn.Dropout(dropout),
             )
             self.output_layer = nn.Linear(decoder_output_dim,
@@ -258,112 +273,114 @@ class Timage(BaseModelWithCovariates):
                  prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
-    def forward(self, x: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        enc_cat  = x["encoder_cat"]
-        enc_cont = x["encoder_cont"]
-        dec_cont = x["decoder_cont"]
-        imgs     = x.get("x_image", None)
-        tgt_scale= x["target_scale"]
 
-        B, L, _ = enc_cont.shape
-        H       = dec_cont.shape[1]
+    def forward(self, x):  # drop the NetworkOutput hint
+        # unpack
+        y_hist    = x["encoder_target"]    # (B,L) or (B,L,D_y)
+        cont_hist = x["encoder_cont"]      # (B,L,C_cont)
+        cont_fut  = x["decoder_cont"]      # (B,H,C_cont)
+        cat_hist  = x.get("encoder_cat")   # (B,L,C_cat) or None
+        cat_fut   = x.get("decoder_cat")   # (B,H,C_cat) or None
+        imgs      = x.get("x_image")       # optional image seq
+        tgt_scale = x["target_scale"]
+
+        B, L, _ = cont_hist.shape
+        H       = cont_fut.size(1)
+
+        # ensure y is 3-D
+        if y_hist.ndim == 2:
+            y_hist = y_hist.unsqueeze(-1)
+        D_y = y_hist.size(-1)
 
         # static features
-        static_cont = enc_cont[:, 0, :]
-        static_cat  = enc_cat[:,  0, :]
-        if hasattr(self, "embeddings"):
-            emb_all    = self.embeddings(enc_cat)
-            static_cat = emb_all[:, 0, :]
-        x_static = torch.cat([static_cont, static_cat], dim=-1)
+        static_cont = cont_hist[:, 0]
+        static_cat  = cat_hist[:, 0].float() if cat_hist is not None else None
+        x_static    = (
+            torch.cat([static_cont, static_cat], dim=-1)
+            if static_cat is not None
+            else static_cont
+        )
 
-        # split targets vs covariates
-        y_hist = enc_cont[..., self.target_positions]
-        mask   = torch.ones(enc_cont.size(-1), dtype=torch.bool, device=enc_cont.device)
-        mask[self.target_positions] = False
-        cov_hist   = enc_cont[..., mask]
-        cov_future = dec_cont[..., mask]
+        # build covariates: continuous + (float) categoricals
+        cov_hist = [cont_hist]
+        cov_fut  = [cont_fut]
+        if cat_hist is not None:
+            cov_hist.append(cat_hist.float())
+            cov_fut.append(cat_fut.float())
+        cov_hist = torch.cat(cov_hist, dim=-1)  # (B, L, C_cov)
+        cov_fut  = torch.cat(cov_fut,  dim=-1)  # (B, H, C_cov)
 
-        # encode time‐series & images
-        ts_emb  = self.encoder_ts((torch.cat([y_hist, cov_hist], dim=-1), cov_future, x_static))
-        img_emb = self.encoder_img(imgs, x_static)
+        # sanity check
+        assert cov_hist.size(-1) == cov_fut.size(-1), (
+            f"cov dim mismatch {cov_hist.size(-1)} vs {cov_fut.size(-1)}"
+        )
 
-        # fuse + SSM
-        attn_out = self.cross_attn(ts_emb, img_emb, img_emb)
-        ssm_out  = self.mamba_ssm(attn_out)
+        # series input
+        series_input = torch.cat([y_hist, cov_hist], dim=-1)
 
-        # decoder MLP
-        dec_emb  = torch.cat([ssm_out, ts_emb], dim=-1).view(B, -1)
-        hidden   = self.decoder_mlp(dec_emb)
+        # run your encoders
+        ts_emb  = self.encoder_ts((series_input, cov_fut, x_static))
+        img_emb = (
+            self.encoder_img(imgs, x_static) if imgs is not None else None
+        )
 
-        if self.classification:
-            # classification head sees a single vector per sample
-            logits = self.classification_head(hidden)  # (B, num_classes)
-            return {"prediction": logits}
-        else:
-            # regression head: reshape → output_dim, add skip, un-normalize
-            out_flat = self.decoder_head(hidden)             # (B, H*decoder_output_dim)
-            out_seq  = out_flat.view(B, H, self.decoder_output_dim)
-            preds_ts = self.output_layer(out_seq)            # (B, H, output_dim)
+        # cross-attend (if you have images)
+        fusion = (
+            self.cross_attn(ts_emb, img_emb, img_emb)
+            if img_emb is not None
+            else ts_emb
+        )
+        state = self.state_encoder(fusion)
 
-            # look-back skip
-            y_hist_flat = y_hist.reshape(B, -1)
-            skip_flat   = self.lookback_skip(y_hist_flat)
-            skip_seq    = skip_flat.view(B, H, self.output_dim)
+        # decode
+        flat    = torch.cat([state, ts_emb], dim=-1).reshape(B, -1)
+        hidden  = self.decoder_mlp(flat)
+        head    = self.decoder_head(hidden)                    # (B, H * D_dec)
+        seq     = head.view(B, H, self.decoder_output_dim)     # (B,H,D_dec)
+        out_ts  = self.output_layer(seq)                       # (B,H,out_dim)
 
-            preds = preds_ts + skip_seq
-            preds = self.transform_output(preds, target_scale=tgt_scale)
-            return self.to_network_output(prediction=preds)
+        # lookback skip
+        skip_in = y_hist.reshape(B, -1)
+        skip    = self.lookback_skip(skip_in).view(B, H, self.output_dim)
+
+        preds = self.transform_output(out_ts + skip, tgt_scale)
+        return self.to_network_output(prediction=preds)
+
 
     @classmethod
     def from_dataset(
         cls,
         dataset: TimeSeriesWithImageDataSet,
-        **model_kwargs: Any
+        **kwargs,  # your model‐hyperparameters
     ) -> "Timage":
-        """
-        Build a Timage directly from a TimeSeriesWithImageDataSet, pulling in
-        all its encoding parameters automatically—and if classification=True,
-        force output_chunk_length=1.
-        """
-        # 1) pull all TimeSeriesWithImageDataSet params
-        params = dataset.get_parameters()
+        # 1) grab the full params
+        full_params = dataset.get_parameters()
+        print("full parameters:", full_params)
+        # 2) extract & remove the image keys
+        image_cols_start = full_params.pop("image_cols_start")
+        image_cols_end   = full_params.pop("image_cols_end")
+        image_shape      = tuple(full_params.pop("image_shape"))
+        # 3) grab the target normalizer
+        transformer = dataset.target_normalizer
+        # 4) now call __init__, passing clean TS params + image bits
+        return cls(
+            dataset_parameters = full_params,
+            output_transformer = transformer,
+            image_cols_start   = image_cols_start,
+            image_cols_end     = image_cols_end,
+            image_shape        = image_shape,
+            **kwargs,  # num_encoder_layers_ts, hidden_size_ts, …
+        )
+    
+    @property
+    def static_variables(self) -> list[str]:
+        """List of all static variables in model"""
+        return self.dataset_parameters["static_categoricals"] + self.dataset_parameters["static_reals"]
 
-        # 2) ensure we use the same target scaler
-        model_kwargs.setdefault("output_transformer", dataset.target_normalizer)
-
-        # 3) pass through dataset params for BaseModelWithCovariates
-        model_kwargs.setdefault("dataset_parameters", params)
-
-        # 4) infer categoricals
-        cats: List[str] = []
-        cats += params.get("static_categoricals", []) or []
-        cats += params.get("time_varying_known_categoricals", []) or []
-        cats += params.get("time_varying_unknown_categoricals", []) or []
-        if cats:
-            model_kwargs.setdefault("x_categoricals", cats)
-
-        # 5) pull through image_shape if it exists on the dataset
-        if hasattr(dataset, "image_shape") and dataset.image_shape is not None:
-            model_kwargs.setdefault("image_shape", dataset.image_shape)
-
-        # 6) enforce classification horizon = 1
-        if model_kwargs.get("classification", False):
-            specified = model_kwargs.get("output_chunk_length", None)
-            if specified is not None and specified != 1:
-                raise ValueError(
-                    f"output_chunk_length must be 1 for classification tasks, "
-                    f"but got output_chunk_length={specified}"
-                )
-            model_kwargs["output_chunk_length"] = 1
-
-        # 7) instantiate the network
-        net = cls(**model_kwargs)
-
-        # 8) sanity‐check your loss matches single vs multi target
-        if dataset.multi_target:
-            assert isinstance(net.loss, MultiLoss), "Expected MultiLoss for multi_target"
-        else:
-            assert not isinstance(net.loss, MultiLoss), "Expected single-target loss"
-
-        return net
-
+    @property
+    def decoder_variables(self) -> list[str]:
+        """List of all decoder variables in model (excluding static variables)"""
+        return (
+            self.dataset_parameters["time_varying_categoricals_decoder"]
+            + self.dataset_parameters["time_varying_reals_decoder"]
+        )

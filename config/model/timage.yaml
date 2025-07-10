@@ -1,10 +1,3 @@
-# config/model/solar.yaml
-_target_: timage_forecasting.model.Timage
-
-# pull window lengths straight from the datamodule block
-input_chunk_length:  ${dataset.max_encoder_length}
-output_chunk_length: ${dataset.max_prediction_length}
-
 # core encoder/decoder sizes
 num_encoder_layers_ts:      2
 hidden_size_ts:            32
@@ -19,3 +12,5 @@ dropout:                   0.1
 # image-encoder backbone
 image_backbone:           "tf_efficientnetv2_b0.in1k"
 image_pretrained:         true
+
+classification: false

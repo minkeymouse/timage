@@ -1,93 +1,339 @@
-from typing import Any, Tuple, Dict
-import torch
-from pytorch_forecasting import TimeSeriesDataSet
+"""
+Timeseries dataset - v2 prototype.
 
-class TimeSeriesWithImageDataSet(TimeSeriesDataSet):
-    """
-    Extends TimeSeriesDataSet by carving out a contiguous block of 'real' columns
-    as flattened image pixels, reshaping them into (C, H, W) frames for the history window.
+Beta version, experimental - use for testing but not in production.
+"""
+
+from typing import Optional, Union, cast, Tuple
+from warnings import warn
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+
+from pytorch_forecasting.utils._coerce import _coerce_to_list
+
+class TimeSeriesWithImage(Dataset):
+    """PyTorch Dataset for time series data stored in pandas DataFrame.
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        data frame with sequence data.
+        Column names must all be str, and contain str as referred to below.
+    data_future : pd.DataFrame, optional, default=None
+        data frame with future data.
+        Column names must all be str, and contain str as referred to below.
+        May contain only columns that are in time, group, weight, known, or static.
+    time : str, optional, default = first col not in group_ids, weight, target, static.
+        integer typed column denoting the time index within ``data``.
+        This column is used to determine the sequence of samples.
+        If there are no missing observations,
+        the time index should increase by ``+1`` for each subsequent sample.
+        The first time_idx for each series does not necessarily
+        have to be ``0`` but any value is allowed.
+    target : str or List[str], optional, default = last column (at iloc -1)
+        column(s) in ``data`` denoting the forecasting target.
+        Can be categorical or numerical dtype.
+    group : List[str], optional, default = None
+        list of column names identifying a time series instance within ``data``.
+        This means that the ``group`` together uniquely identify an instance,
+        and ``group`` together with ``time`` uniquely identify a single observation
+        within a time series instance.
+        If ``None``, the dataset is assumed to be a single time series.
+    weight : str, optional, default=None
+        column name for weights.
+        If ``None``, it is assumed that there is no weight column.
+    num : list of str, optional, default = all columns with dtype in "fi"
+        list of numerical variables in ``data``,
+        list may also contain list of str, which are then grouped together.
+    cat : list of str, optional, default = all columns with dtype in "Obc"
+        list of categorical variables in ``data``,
+        list may also contain list of str, which are then grouped together
+        (e.g. useful for product categories).
+    known : list of str, optional, default = all variables
+        list of variables that change over time and are known in the future,
+        list may also contain list of str, which are then grouped together
+        (e.g. useful for special days or promotion categories).
+    unknown : list of str, optional, default = no variables
+        list of variables that are not known in the future,
+        list may also contain list of str, which are then grouped together
+        (e.g. useful for weather categories).
+    static : list of str, optional, default = all variables not in known, unknown
+        list of variables that do not change over time,
+        list may also contain list of str, which are then grouped together.
+    image_col_start: Starting pixel of image data, left -> right, top -> bottom order.
+    image_col_end: Ending pixel of image data, left -> right, top -> bottom order.
+    image_shape: Shape of image data, (C, H, W).
     """
 
     def __init__(
         self,
-        *,
-        image_cols_start: str,
-        image_cols_end: str,
-        image_shape: Tuple[int, int, int],
-        **ts_kwargs: Any,
-    ):
-        # Initialize base TS dataset
-        super().__init__(**ts_kwargs)
+        data: pd.DataFrame,
+        data_future: Optional[pd.DataFrame] = None,
+        time: Optional[str] = None,
+        target: Optional[Union[str, list[str]]] = None,
+        group: Optional[list[str]] = None,
+        weight: Optional[str] = None,
+        num: Optional[list[Union[str, list[str]]]] = None,
+        cat: Optional[list[Union[str, list[str]]]] = None,
+        known: Optional[list[Union[str, list[str]]]] = None,
+        unknown: Optional[list[Union[str, list[str]]]] = None,
+        static: Optional[list[Union[str, list[str]]]] = None,
 
-        # stash image info
+        image_cols_start: Optional[str] = None,
+        image_cols_end: Optional[str] = None,
+        image_shape: Optional[Tuple[int, int, int]] = None,
+        future_image: Optional[bool] = False,
+    ):
+        self.data = data
+        self.data_future = data_future
+        self.time = time
+        self.target = target
+        self.group = group
+        self.weight = weight
+        self.num = num
+        self.cat = cat
+        self.known = known
+        self.unknown = unknown
+        self.static = static
         self.image_cols_start = image_cols_start
         self.image_cols_end   = image_cols_end
-        self.image_shape      = image_shape  # (C, H, W)
+        self.image_shape      = image_shape
+        self.future_image = future_image
 
-        # identify the pixel columns among self.reals
-        if image_cols_start not in self.reals or image_cols_end not in self.reals:
-            raise ValueError(
-                f"image_cols_start/end must be in self.reals; "
-                f"got {image_cols_start!r}, {image_cols_end!r} not in {self.reals}"
-            )
-        start_idx = self.reals.index(image_cols_start)
-        end_idx   = self.reals.index(image_cols_end)
-        if start_idx > end_idx:
-            raise ValueError(f"{image_cols_start!r} must come before {image_cols_end!r}")
+        start = cast(int, data.columns.get_loc(image_cols_start))
+        end   = cast(int, data.columns.get_loc(image_cols_end))
+        image_cols = data.columns.to_list()[start : end + 1]
 
-        # build and validate the flattened‐image column list
-        self.image_cols = self.reals[start_idx : end_idx + 1]
+        super().__init__()
+
+        # handle defaults, coercion, and derived attributes
+        self._target = _coerce_to_list(target)
+        self._group = _coerce_to_list(group)
+        self._num = _coerce_to_list(num)
+        self._cat = _coerce_to_list(cat)
+        self._known = _coerce_to_list(known)
+        self._unknown = _coerce_to_list(unknown)
+        self._static = _coerce_to_list(static)
+        self._img = _coerce_to_list(image_cols)
+
+        self.feature_cols = [
+            col
+            for col in data.columns
+            if col not in [self.time] + self._group + [self.weight] + self._target + self._img
+        ]
+        if self._group:
+            self._groups = self.data.groupby(self._group).groups
+            self._group_ids = list(self._groups.keys())
+        else:
+            self._groups = {"_single_group": self.data.index}
+            self._group_ids = ["_single_group"]
+
+        self._prepare_metadata()
+
+        # overwrite __init__ params for upwards compatibility with AS PRs
+        # todo: should we avoid this and ensure classes are dataclass-like?
+        self.group = self._group
+        self.target = self._target
+        self.num = self._num
+        self.cat = self._cat
+        self.known = self._known
+        self.unknown = self._unknown
+        self.static = self._static
+
+    def _prepare_metadata(self):
+        """Prepare metadata for the dataset.
+
+        The funcion returns metadata that contains:
+
+        * ``cols``: dict { 'y': list[str], 'x': list[str], 'st': list[str] }
+          Names of columns for y, x, and static features.
+          List elements are in same order as column dimensions.
+          Columns not appearing are assumed to be named (x0, x1, etc.),
+          (y0, y1, etc.), (st0, st1, etc.).
+        * ``col_type``: dict[str, str]
+          maps column names to data types "F" (numerical) and "C" (categorical).
+          Column names not occurring are assumed "F".
+        * ``col_known``: dict[str, str]
+          maps column names to "K" (future known) or "U" (future unknown).
+          Column names not occurring are assumed "K".
+        """
+        self.metadata = {
+            "cols": {
+                "y": self._target,
+                "x": self.feature_cols,
+                "st": self._static,
+                "img": self._img
+            },
+            "col_type": {},
+            "col_known": {},
+        }
+
+        all_cols = self._target + self.feature_cols + self._static + self._img
+        for col in all_cols:
+            self.metadata["col_type"][col] = "C" if col in self._cat else "F"
+
+            self.metadata["col_known"][col] = "K" if col in self._known else "U"
+
+            if self.future_image and col in self._img:
+                self.metadata["col_known"][col] = "K"
+                
+    def __len__(self) -> int:
+        """Return number of time series in the dataset."""
+        return len(self._group_ids)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Get time series data for given index.
+
+        Returns
+        -------
+        t : numpy.ndarray of shape (n_timepoints,)
+            Time index for each time point in the past or present. Aligned with `y`,
+            and `x` not ending in `f`.
+
+        y : torch.Tensor of shape (n_timepoints, n_targets)
+            Target values for each time point. Rows are time points, aligned with `t`.
+
+        x : torch.Tensor of shape (n_timepoints, n_features)
+            Features for each time point. Rows are time points, aligned with `t`.
+
+        group : torch.Tensor of shape (n_groups,)
+            Group identifiers for time series instances.
+
+        st : torch.Tensor of shape (n_static_features,)
+            Static features.
+
+        img: torch.Tensor of shape (n_timepoints, )
+
+        cutoff_time : float or numpy.float64
+            Cutoff time for the time series instance.
+
+        Other Returns
+        -------------
+        weights : torch.Tensor of shape (n_timepoints,), optional
+            Only included if weights are not `None`.
+        """
+        time = self.time
+        feature_cols = self.feature_cols
+        _target = self._target
+        _known = self._known
+        _static = self._static
+        _group = self._group
+        _groups = self._groups
+        _group_ids = self._group_ids
+        weight = self.weight
+        data_future = self.data_future
+        image_cols = self._img
+        image_shape = self.image_shape
+
+        group_id = _group_ids[index]
+
+        if _group:
+            mask = _groups[group_id]
+            data = self.data.loc[mask]
+        else:
+            data = self.data
+
+        cutoff_time = data[time].max()
+
+        data_vals = data[time].values
+        data_tgt_vals = data[_target].values
+        data_feat_vals = data[feature_cols].values
+        data_img_vals = data[image_cols].values.astype(float)
+
+        T = data_img_vals.shape[0]
         C, H, W = image_shape
-        expected = C * H * W
-        if len(self.image_cols) != expected:
-            raise ValueError(
-                f"Found {len(self.image_cols)} image columns but expected {expected} "
-                f"({C}×{H}×{W})"
+
+        result = {
+            "t": data_vals,
+            "y": torch.tensor(data_tgt_vals),
+            "x": torch.tensor(data_feat_vals),
+            "group": torch.tensor([hash(str(group_id))]),
+            "st": torch.tensor(data[_static].iloc[0].values if _static else []),
+            "img": torch.tensor(data_img_vals.reshape(T,C,H,W), dtype=torch.float32),
+            "cutoff_time": cutoff_time,
+        }
+
+        if data_future is not None:
+            if _group:
+                future_mask = self.data_future.groupby(_group).groups[group_id]
+                future_data = self.data_future.loc[future_mask]
+            else:
+                future_data = self.data_future
+
+            data_fut_vals = future_data[time].values
+
+            combined_times = np.concatenate([data_vals, data_fut_vals])
+            combined_times = np.unique(combined_times)
+            combined_times.sort()
+
+            num_timepoints = len(combined_times)
+            x_merged = np.full((num_timepoints, len(feature_cols)), np.nan)
+            y_merged = np.full((num_timepoints, len(_target)), np.nan)
+            img_merged = np.full((num_timepoints, C, H, W), np.nan)
+
+            current_time_indices = {t: i for i, t in enumerate(combined_times)}
+            for i, t in enumerate(data_vals):
+                idx = current_time_indices[t]
+                x_merged[idx] = data_feat_vals[i]
+                y_merged[idx] = data_tgt_vals[i]
+                img_merged[idx] = data_img_vals[i].reshape(C, H, W)
+
+            for i, t in enumerate(data_fut_vals):
+                if t in current_time_indices:
+                    idx = current_time_indices[t]
+                    for j, col in enumerate(_known):
+                        if col in feature_cols:
+                            feature_idx = feature_cols.index(col)
+                            x_merged[idx, feature_idx] = future_data[col].values[i]
+
+            if self.future_image:
+                fut_img_flat = future_data[image_cols].values.astype(float)
+                for i, t in enumerate(data_fut_vals):
+                    if t in current_time_indices:
+                        idx = current_time_indices[t]
+                        img_merged[idx] = fut_img_flat[i].reshape(C, H, W)
+
+            result.update(
+                {
+                    "t": combined_times,
+                    "x": torch.tensor(x_merged, dtype=torch.float32),
+                    "y": torch.tensor(y_merged, dtype=torch.float32),
+                    "img": torch.tensor(img_merged, dtype=torch.float32),
+                }
             )
 
-        # compute masks for slicing contiguously
-        self._image_idx = [ self.reals.index(c) for c in self.image_cols ]
-        keep_mask = torch.ones(len(self.reals), dtype=torch.bool)
-        keep_mask[self._image_idx] = False
-        self._keep_mask = keep_mask
+        if weight:
+            if self.data_future is not None and self.weight in self.data_future.columns:
+                weights_merged = np.full(num_timepoints, np.nan)
+                for i, t in enumerate(data_vals):
+                    idx = current_time_indices[t]
+                    weights_merged[idx] = data[weight].values[i]
 
-        # pull target metadata for downstream slicing
-        params = self.get_parameters()
-        self.target_positions = params["target_positions"]
+                for i, t in enumerate(data_fut_vals):
+                    if t in current_time_indices and self.weight in future_data.columns:
+                        idx = current_time_indices[t]
+                        weights_merged[idx] = future_data[weight].values[i]
 
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Any]:
-        x, (y, w) = super().__getitem__(idx)
+                result["weights"] = torch.tensor(weights_merged, dtype=torch.float32)
+            else:
+                result["weights"] = torch.tensor(
+                    data[self.weight].values, dtype=torch.float32
+                )
 
-        # concatenate encoder+decoder continuous features
-        enc = x["encoder_cont"]    # (L, D)
-        dec = x["decoder_cont"]    # (H, D)
-        all_cont = torch.cat([enc, dec], dim=0)  # (L+H, D)
+        return result
 
-        # split off image pixels and the rest
-        flat_pixels = all_cont[:, self._image_idx]      # (L+H, N)
-        cont_no_img = all_cont[:, self._keep_mask]      # (L+H, D-N)
+    def get_metadata(self) -> dict:
+        """Return metadata about the dataset.
 
-        # restore encoder/decoder splits
-        L = enc.size(0)
-        x["encoder_cont"] = cont_no_img[:L]
-        x["decoder_cont"] = cont_no_img[L:]
-
-        # only take history-window frames for images
-        pixel_hist = flat_pixels[:L]                    # (L, N)
-        C, H, W = self.image_shape
-        x["x_image"] = pixel_hist.view(L, C, H, W)      # (L, C, H, W)
-
-        return x, (y, w)
-
-    @staticmethod
-    def _collate_fn(batches: Any) -> Any:
-        # standard TSDataSet batching
-        batch_x, (batch_y, batch_w) = TimeSeriesDataSet._collate_fn(batches)
-        # stack the image tensors
-        imgs = torch.stack([ b[0]["x_image"] for b in batches ], dim=0)
-        batch_x["x_image"] = imgs  # (B, L, C, H, W)
-        return batch_x, (batch_y, batch_w)
-
-    def get_parameters(self) -> Dict[str, Any]:
-        # ensure TS-DataSet parameters bubble up
-        return super().get_parameters()
+        Returns
+        -------
+        Dict
+            Dictionary containing:
+            - cols: column names for y, x, and static features
+            - col_type: mapping of columns to their types (F/C)
+            - col_known: mapping of columns to their future known status (K/U)
+        """
+        return self.metadata
