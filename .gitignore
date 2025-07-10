@@ -182,3 +182,4 @@ experiments/
 config/
 
 *.yaml
+*.ckpt
