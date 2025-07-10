@@ -1,9 +1,3 @@
-"""
-Timeseries dataset - v2 prototype.
-
-Beta version, experimental - use for testing but not in production.
-"""
-
 from typing import Optional, Union, cast, Tuple
 from warnings import warn
 
@@ -169,15 +163,22 @@ class TimeSeriesWithImage(Dataset):
             },
             "col_type": {},
             "col_known": {},
+            "img_size": self.image_shape
         }
 
         all_cols = self._target + self.feature_cols + self._static + self._img
         for col in all_cols:
-            self.metadata["col_type"][col] = "C" if col in self._cat else "F"
-
+            if col in self._img:
+                col_type = "IMG"
+            elif col in self._cat:
+                col_type = "C"
+            else:
+                col_type = "F"
+            self.metadata["col_type"][col] = col_type
             self.metadata["col_known"][col] = "K" if col in self._known else "U"
 
-            if self.future_image and col in self._img:
+        if self.future_image:
+            for col in self._img:
                 self.metadata["col_known"][col] = "K"
                 
     def __len__(self) -> int:
@@ -332,7 +333,7 @@ class TimeSeriesWithImage(Dataset):
         -------
         Dict
             Dictionary containing:
-            - cols: column names for y, x, and static features
+            - cols: column names for y, x, static features, and images
             - col_type: mapping of columns to their types (F/C)
             - col_known: mapping of columns to their future known status (K/U)
         """

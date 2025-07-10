@@ -5,10 +5,6 @@ import pytorch_lightning as pl
 import hydra
 from omegaconf import DictConfig
 
-from timage_forecasting.dataset import TimeSeriesWithImageDataSet
-from timage_forecasting.model import Timage
-
-# src/timage_forecasting/train.py
 @hydra.main(config_path="../../config", config_name="config")
 def main(cfg: DictConfig):
     pl.seed_everything(cfg.experiment.seed, workers=True)

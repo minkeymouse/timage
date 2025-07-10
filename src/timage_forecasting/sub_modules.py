@@ -2,135 +2,147 @@
 import torch
 import torch.nn as nn
 import timm
-from typing import cast
+from typing import cast, Any
 
 # Pytorch Forecasting Modules
 from pytorch_forecasting.models.temporal_fusion_transformer.sub_modules import GatedResidualNetwork as _GRN
 from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock as _RB
 
-# Time series Encoder
+import torch
+import torch.nn as nn
+from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock as _RB
+
 class _TimeSeriesEncoder(nn.Module):
+    """
+    MLP‐based encoder that turns L steps of (target + encoder cov + decoder cov)
+    plus static covariates into an (L × E) embedding.
+
+    Args:
+        target_dim:           number of target channels D_y
+        enc_cat_dim:          number of encoder categorical covariates
+        enc_cont_dim:         number of encoder continuous covariates
+        dec_cat_dim:          number of decoder categorical covariates (known a priori)
+        dec_cont_dim:         number of decoder continuous covariates (known a priori)
+        cat_static:           number of static categorical covariates
+        cont_static:          number of static continuous covariates
+        input_chunk_length:   history length L
+        output_chunk_length:  prediction horizon H (for covariate concatenation)
+        encoder_layers:       number of residual blocks
+        hidden_size:          hidden size of each MLP block
+        embed_dim:            final embedding dimension E per time step
+        use_layer_norm:       whether to layer‐norm the final embeddings
+        dropout:              dropout rate inside blocks
+    """
     def __init__(
         self,
-        output_dim: int,            # D_y
-        future_cov_dim: int,        # D_f
-        temporal_hidden_size_future: int,
-        temporal_width_future: int, # projected cov_dim
-        static_cov_dim: int,        # D_s
-        input_chunk_length: int,    # L
-        output_chunk_length: int,   # H, only for flattening
-        num_encoder_layers: int,
+        target_dim: int,
+        enc_cat_dim: int,
+        enc_cont_dim: int,
+        dec_cat_dim: int,
+        dec_cont_dim: int,
+        cat_static_dim: int,
+        cont_static_dim: int,
+        input_chunk_length: int,
+        output_chunk_length: int,
+        encoder_layers: int,
         hidden_size: int,
-        embed_dim: int,             # E
+        embed_dim: int,
         use_layer_norm: bool,
         dropout: float,
     ):
         super().__init__()
+
+        # keep shapes
         L, H = input_chunk_length, output_chunk_length
-        self.output_dim = output_dim
-        self.L = L
-        self.H = H
-        self.future_cov_dim = future_cov_dim
+        D_y = target_dim
+        D_enc = enc_cat_dim + enc_cont_dim
+        D_dec = dec_cat_dim + dec_cont_dim
+        D_static = cat_static_dim + cont_static_dim
 
-        # 1) optional projection of future covariates
-        if future_cov_dim > 0 and temporal_width_future > 0:
-            self.future_cov_projection = _RB(
-                input_dim=future_cov_dim,
-                output_dim=temporal_width_future,
-                hidden_size=temporal_hidden_size_future,
-                use_layer_norm=use_layer_norm,
-                dropout=dropout,
-            )
-            cov_dim = temporal_width_future
-        else:
-            self.future_cov_projection = None
-            cov_dim = future_cov_dim
+        # total flattened MLP input size:
+        mlp_in = L * D_y + (L + H) * (D_enc + D_dec) + D_static
 
-        # 2) compute flattened input size = L·D_y + (L+H)·cov_dim + D_s
-        encoder_input_dim = L * output_dim + (L + H) * cov_dim + static_cov_dim
-
-        # 3) MLP bottleneck (like TiDE)
-        layers = [ _RB(
-            input_dim=encoder_input_dim,
-            output_dim=hidden_size,
-            hidden_size=hidden_size,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
-        ) ]
-        for _ in range(num_encoder_layers - 1):
-            layers.append(_RB(
-                input_dim=hidden_size,
+        # build a stack of residual MLP blocks
+        blocks = [
+            _RB(
+                input_dim=mlp_in if i == 0 else hidden_size,
                 output_dim=hidden_size,
                 hidden_size=hidden_size,
                 use_layer_norm=use_layer_norm,
                 dropout=dropout,
-            ))
-        self.encoder_mlp = nn.Sequential(*layers)
+            )
+            for i in range(encoder_layers)
+        ]
+        self.encoder_mlp = nn.Sequential(*blocks)
 
-        # 4) unpack: hidden_size -> L*E
+        # project into L × E
         self.embedding_head = nn.Sequential(
             nn.Linear(hidden_size, L * embed_dim),
             nn.Dropout(dropout),
         )
 
-        # 5) learned positional bias over the L history steps
-        self.pos_encoding = nn.Parameter(torch.randn(1, L, embed_dim)*0.02)
-        self.layer_norm  = nn.LayerNorm(embed_dim) if use_layer_norm else None
+        # learned positional bias + optional layer norm
+        self.pos_encoding = nn.Parameter(torch.randn(1, L, embed_dim) * 0.02)
+        self.layer_norm = nn.LayerNorm(embed_dim) if use_layer_norm else None
 
-    def forward(self, x_in):
+        # stash for forward
+        self.L = L
+        self.embed_dim = embed_dim
+        self.D_y = D_y
+        self.D_enc = D_enc
+        self.D_dec = D_dec
+        self.D_static = D_static
+
+    def forward(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Args:
-          x_past:        Tensor of shape (B, L, D_y + D_fpast)
-                         — the first D_y channels are the past target values,
-                           the last   D_fpast channels are any past covariates
-          x_future_cov:  Tensor of shape (B, H, D_ffuture)
-                         — the known covariates over the next H time-steps
-          x_static:      Tensor of shape (B, D_s)
-                         — the static (time-invariant) covariates
+        x must contain:
+          - "encoder_cat": (B, L, enc_cat_dim)
+          - "encoder_cont": (B, L, enc_cont_dim)
+          - "decoder_cat": (B, H, dec_cat_dim)
+          - "decoder_cont": (B, H, dec_cont_dim)
+          - "static_categorical_features": (B, cat_static_dim)  — optional
+          - "static_continuous_features": (B, cont_static_dim)  — optional
 
         Returns:
-          embeddings:    Tensor of shape (B, L, E)
-                         — one E-dimensional embedding per past time-step
+          embeddings: (B, L, embed_dim)
         """
-        x_past, x_future_cov, x_static = x_in
-        B = x_past.size(0)
-        L, H = self.L, self.H
+        B, L, E = x["encoder_cat"].size(0), self.L, self.embed_dim
 
-        # a) last L of the target dims
-        x_hist = x_past[:, :L, :self.output_dim]          # (B, L, D_y)
+        # 1) flatten past target if you want:
+        #    here we assume the first D_y dims of encoder_cont are past targets;
+        #    adapt if you feed y separately
+        #    x_y = x["encoder_cont"][..., : self.D_y]  # if needed
 
-        # b) build dyn covs = last-L past covs  +  H future covs
-        has_future = self.future_cov_dim > 0
-        if has_future and self.future_cov_projection is not None:
-            hist_cov = x_past[:, :L, -self.future_cov_dim:]  # (B, L, D_f)
-            dyn = torch.cat([hist_cov, x_future_cov], dim=1)  # (B, L+H, D_f)
-            if self.future_cov_projection:
-                dyn = self.future_cov_projection(dyn)         # (B, L+H, cov_dim)
-        elif has_future:
-            # just concatenate without projection
-            hist_cov = x_past[:, :L, -self.future_cov_dim:]
-            dyn = torch.cat([hist_cov, x_future_cov], dim=1)
+        # 2) flatten all time‐dependent covariates
+        enc_cat = x["encoder_cat"].reshape(B, -1)       # (B, L*enc_cat_dim)
+        enc_cont = x["encoder_cont"].reshape(B, -1)     # (B, L*enc_cont_dim)
+        dec_cat = x["decoder_cat"].reshape(B, -1)       # (B, H*dec_cat_dim)
+        dec_cont = x["decoder_cont"].reshape(B, -1)     # (B, H*dec_cont_dim)
+        time_flat = torch.cat([enc_cat, enc_cont, dec_cat, dec_cont], dim=1)
+
+        # 3) static
+        if "static_categorical_features" in x:
+            st_cat = x["static_categorical_features"]
+            st_cont = x["static_continuous_features"]
+            static_flat = torch.cat([st_cat, st_cont], dim=1)
         else:
-            dyn = None
+            static_flat = x.get("static", torch.zeros(B, self.D_static, device=enc_cat.device))
 
-        # c) flatten everything
-        parts = [x_hist, dyn, x_static]
-        flat  = [t.flatten(1) for t in parts if t is not None]  # each -> (B, ·)
-        enc_in = torch.cat(flat, dim=1)                         # (B, encoder_input_dim)
+        # 4) build full MLP input: [Y_flat | time_flat | static_flat]
+        #    if you have separate past Y, insert it here
+        mlp_input = torch.cat([time_flat, static_flat], dim=1)
 
-        # d) MLP → single vector
-        hidden = self.encoder_mlp(enc_in)                       # (B, hidden_size)
+        # 5) MLP → bottleneck
+        hidden = self.encoder_mlp(mlp_input)            # (B, hidden_size)
 
-        # e) unpack into L embeddings
-        emb_flat   = self.embedding_head(hidden)                # (B, L*E)
-        embeddings = emb_flat.view(B, L, -1)                    # (B, L, E)
+        # 6) project → L*E → (B, L, E)
+        emb = self.embedding_head(hidden).view(B, L, E)
 
-        # f) add positional bias + optional LN
-        embeddings = embeddings + self.pos_encoding              # (B, L, E)
-        if self.layer_norm:
-            embeddings = self.layer_norm(embeddings)
-
-        return embeddings  # (B, L, E)
+        # 7) add pos bias + optional LN
+        emb = emb + self.pos_encoding
+        if self.layer_norm is not None:
+            emb = self.layer_norm(emb)
+        return emb
 
 # Temporal Image Encoder
 class _TemporalImageEncoder(nn.Module):
@@ -139,10 +151,11 @@ class _TemporalImageEncoder(nn.Module):
     """
     def __init__(
         self,
-        embed_dim: int,
-        static_cov_dim: int,
         input_chunk_length: int,
-        in_chans: int = 1,
+        cat_static_dim: int,
+        cont_static_dim: int,
+        image_size: Any,
+        embed_dim: int,
         backbone_name: str = "tf_efficientnetv2_b0.in1k",
         pretrained: bool = True,
         train_backbone: bool = True,
@@ -153,25 +166,28 @@ class _TemporalImageEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.input_chunk_length = input_chunk_length
         self.train_backbone = train_backbone
+        self.cat_static_dim = cat_static_dim
+        self.conf_static_dim = cont_static_dim
+        self.image_size = image_size
 
         # 1) spatial backbone → global max pool → (B*L, feat_ch)
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
-            in_chans=in_chans,
+            in_chans=self.image_size[0],
             num_classes=0,
             global_pool="max",
         )
         feat_ch = cast(int, self.backbone.num_features)
 
-        # 2) project each frame's features into embed_dim
         self.frame_proj = nn.Sequential(
             nn.Linear(feat_ch, embed_dim),
             nn.GELU(),
             nn.Dropout(dropout),
         )
 
-        # 3) static-conditioning FiLM gate: GRN -> Linear to 2*embed_dim
+        static_cov_dim = self.cat_static_dim + self.conf_static_dim
+
         self.static_gate = nn.Sequential(
             _GRN(
                 input_size=static_cov_dim,
@@ -182,7 +198,6 @@ class _TemporalImageEncoder(nn.Module):
             nn.Linear(static_cov_dim, embed_dim * 2),
         )
 
-        # 4) learned positional bias over L frames
         self.pos_encoding = nn.Parameter(
             torch.randn(1, input_chunk_length, embed_dim) * 0.02
         )

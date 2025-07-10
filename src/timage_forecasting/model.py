@@ -1,165 +1,110 @@
 """
 Timage for image integrated time series forecasting.
 """
-from typing import Optional, Any, Tuple, Dict, List
+from typing import Optional, Any, Tuple, Dict, List, Union
 
 import torch
 from torch import nn
-from torchmetrics import Accuracy
+from torch.optim import Optimizer
 
 from pytorch_forecasting.metrics import MAE, MAPE, MASE, RMSE, SMAPE
-from pytorch_forecasting.models.base import BaseModel, BaseModelWithCovariates
 from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
 from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock
 from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
 
-from timage_forecasting.dataset import TimeSeriesWithImageDataSet
+from timage_forecasting.base import BaseModel
+from timage_forecasting.dataset import TimeSeriesWithImage
+from timage_forecasting.datamodule import EncoderDecoderTimeSeriesDataModule
 from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
 
 import warnings
-warnings.filterwarnings(
-    "ignore",
-    message="X does not have valid feature names, but StandardScaler was fitted with feature names",
-    category=UserWarning,
-    module="sklearn.utils.validation",
-)
 
-class Timage(BaseModelWithCovariates):
+class Timage(BaseModel):
     """Image integrated time series model for long-term forecasting."""
     def __init__(
         self,
-        dataset_parameters: Dict[str, Any],
-        output_transformer: Any,
-
-        image_cols_start: str,
-        image_cols_end:   str,
-        image_shape:      Tuple[int,int,int],
-
-        num_encoder_layers_ts: int,       # how many layers in your TS encoder
-        hidden_size_ts:           int,       # embedding / hidden size of TS encoder
-        num_decoder_layers:       int,       # number of residual blocks in decoder
-        decoder_output_dim:       int,       # width of the decoder MLP’s output before final projection
-        temporal_width_future:    int = 4,   # how many future steps your TS encoder “sees” internally
-        temporal_hidden_size_future: int = 32, 
-        temporal_decoder_hidden:  int = 32,  # hidden size inside each decoder block
-        use_layer_norm:           bool = False,
+        embedding_size: int,
+        encoder_layers: int,
+        encoder_hidden_size: int,
+        decoder_layers: int,  
+        decoder_hidden_size: int,
+        loss: nn.Module,
+        use_layer_norm: bool = True,
         dropout:                  float = 0.1,
-        image_backbone:           str = "tf_efficientnetv2_b0.in1k",
-        image_pretrained:         bool = True,
-        embedding_sizes:       Optional[dict[str, int]] = None,
-        x_categoricals: Optional[List[str]] = None, 
-        classification: Optional[bool] = False,
-        num_classes: Optional[int] = None,
-        classification_task: Optional[str] = None,
-        **kwargs
+        image_backbone: str = "tf_efficientnetv2_b0.in1k",
+        image_pretrained: bool = True,
+        metadata: dict = {},
+
+        classification: bool = False,
+        image_size: Tuple[int, int, int] = (1,24,24),
+
+        logging_metrics: Optional[list[nn.Module]] = None,
+        optimizer: Optional[Union[Optimizer, str]] = "adam",
+        optimizer_params: Optional[dict] = None,
+        lr_scheduler: Optional[str] = None,
+        lr_scheduler_params: Optional[dict] = None,
     ):
         super().__init__(
-            dataset_parameters = dataset_parameters,
-            output_transformer = output_transformer,
-            **{})
-        
-        # 1) classification branch
-        if classification:
-            if classification_task not in {"binary", "multiclass", "multilabel"}:
-                raise ValueError(f"Unsupported task {classification_task!r}")
+            loss=loss,
+            logging_metrics=logging_metrics,
+            optimizer=optimizer,
+            optimizer_params=optimizer_params or {},
+            lr_scheduler=lr_scheduler,
+            lr_scheduler_params=lr_scheduler_params or {},
+        )
 
-            # ensure num_classes for anything beyond binary
-            if classification_task in {"multiclass", "multilabel"} and num_classes is None:
-                raise ValueError("num_classes must be set for multiclass/multilabel")
-
-            # pick loss
-            if classification_task == "multiclass":
-                self.loss = nn.CrossEntropyLoss()
-            else:
-                # binary or multilabel
-                self.loss = nn.BCEWithLogitsLoss()
-
-            # build metrics list
-            metrics = []
-            # Accuracy
-            metrics.append(Accuracy(task=classification_task,
-                                    num_classes=num_classes))
-            
-        else:
-            self.loss = RMSE()
-            metrics = [SMAPE(), MAE(), RMSE(), MAPE(), MASE()]
-
-        # register them as submodules
-        self.logging_metrics = nn.ModuleList(metrics)
-
-        # store 
-        self.dataset_parameters = dataset_parameters
-        self.output_dim = len(dataset_parameters["target"])
-        self.input_chunk_length = dataset_parameters["max_encoder_length"]
-        self.output_chunk_length = dataset_parameters["max_prediction_length"]
-
-        self.num_encoder_layers_ts = num_encoder_layers_ts
-        self.hidden_size_ts = hidden_size_ts
-        self.num_decoder_layers = num_decoder_layers
-        self.decoder_output_dim = decoder_output_dim
-
-
-        self.temporal_width_future = temporal_width_future
-        self.temporal_hidden_size_future = temporal_hidden_size_future
-        self.temporal_decoder_hidden = temporal_decoder_hidden
-
-
+        # store hyperparameters
+        self.embedding_size = embedding_size
+        self.encoder_layers = encoder_layers
+        self.encoder_hidden_size = encoder_hidden_size
+        self.decoder_layers = decoder_layers
+        self.decoder_hidden_size = decoder_hidden_size
         self.use_layer_norm = use_layer_norm
         self.dropout = dropout
         self.image_backbone = image_backbone
         self.image_pretrained = image_pretrained
-        self.image_cols_start = image_cols_start
-        self.image_cols_end   = image_cols_end
-        self.image_shape      = image_shape
-
-        self.embedding_sizes = embedding_sizes
-
-        # Categoricals
-        self.x_categoricals = x_categoricals
         self.classification = classification
-        self.num_classes = num_classes
-        self.classification_task = classification_task
+        self.image_size = image_size
+        self.metadata = metadata
 
-        self.save_hyperparameters(ignore=["loss", "logging_metrics"])
-        
-        if self.embedding_sizes and self.x_categoricals is not None:
-            self.embeddings = MultiEmbedding(
-                embedding_sizes=self.embedding_sizes,
-                x_categoricals=self.x_categoricals,
-            )
+        # extract dims from metadata
+        self.target_dim = metadata["target"]
+        self.enc_cat_dim = metadata["encoder_cat"]
+        self.enc_cont_dim = metadata["encoder_cont"]
+        self.dec_cat_dim = metadata["decoder_cat"]
+        self.dec_cont_dim = metadata["decoder_cont"]
+        self.cat_static = metadata.get("static_categorical_features", 0)
+        self.cont_static = metadata.get("static_continuous_features", 0)
 
-        static_cov_dim = len(self.static_variables)
-        
-        # how many real + categorical covariates you actually feed
-        cont_dim = len(dataset_parameters["time_varying_unknown_reals"]) \
-                 + len(dataset_parameters["time_varying_known_reals"])
-        cat_dim  = len(dataset_parameters["time_varying_unknown_categoricals"]) \
-                 + len(dataset_parameters["time_varying_known_categoricals"])
-        future_cov_dim = cont_dim + cat_dim
+        # sequence lengths
+        self.L = metadata["max_encoder_length"]
+        self.H = metadata["max_prediction_length"]
 
+        # instantiate the time series encoder
         self.encoder_ts = _TimeSeriesEncoder(
-            output_dim=self.output_dim,
-            future_cov_dim=future_cov_dim,
-            temporal_hidden_size_future=temporal_hidden_size_future,
-            temporal_width_future=temporal_width_future,
-            static_cov_dim=static_cov_dim,
-            input_chunk_length=self.input_chunk_length,
-            output_chunk_length=self.output_chunk_length,
-            num_encoder_layers=num_encoder_layers_ts,
-            hidden_size=hidden_size_ts,
-            embed_dim=hidden_size_ts,
-            use_layer_norm=use_layer_norm,
-            dropout=dropout,
+            target_dim=self.target_dim,
+            enc_cat_dim=self.enc_cat_dim,
+            enc_cont_dim=self.enc_cont_dim,
+            dec_cat_dim=self.dec_cat_dim,
+            dec_cont_dim=self.dec_cont_dim,
+            cat_static_dim=self.cat_static,
+            cont_static_dim=self.cont_static,
+            input_chunk_length=self.L,
+            output_chunk_length=self.H,
+            encoder_layers=self.encoder_layers,
+            hidden_size=self.encoder_hidden_size,
+            embed_dim=self.embedding_size,
+            use_layer_norm=self.use_layer_norm,
+            dropout=self.dropout,
         )
 
-        in_channels = image_shape[0] if (image_shape is not None and len(image_shape) == 3) else 1
         self.encoder_img = _TemporalImageEncoder(
             embed_dim=hidden_size_ts,
             static_cov_dim=static_cov_dim,
             input_chunk_length=self.input_chunk_length,
             backbone_name = self.image_backbone,
             pretrained = self.image_pretrained,
-            in_chans=in_channels,
+            in_chans=self.image_size[0],
             use_layer_norm=use_layer_norm,
             dropout=dropout,
         )
