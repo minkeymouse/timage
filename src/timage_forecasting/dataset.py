@@ -1,5 +1,4 @@
 from typing import Optional, Union, cast, Tuple
-from warnings import warn
 
 import numpy as np
 import pandas as pd
@@ -10,56 +9,6 @@ from pytorch_forecasting.utils._coerce import _coerce_to_list
 
 class TimeSeriesWithImage(Dataset):
     """PyTorch Dataset for time series data stored in pandas DataFrame.
-
-    Parameters
-    ----------
-    data : pd.DataFrame
-        data frame with sequence data.
-        Column names must all be str, and contain str as referred to below.
-    data_future : pd.DataFrame, optional, default=None
-        data frame with future data.
-        Column names must all be str, and contain str as referred to below.
-        May contain only columns that are in time, group, weight, known, or static.
-    time : str, optional, default = first col not in group_ids, weight, target, static.
-        integer typed column denoting the time index within ``data``.
-        This column is used to determine the sequence of samples.
-        If there are no missing observations,
-        the time index should increase by ``+1`` for each subsequent sample.
-        The first time_idx for each series does not necessarily
-        have to be ``0`` but any value is allowed.
-    target : str or List[str], optional, default = last column (at iloc -1)
-        column(s) in ``data`` denoting the forecasting target.
-        Can be categorical or numerical dtype.
-    group : List[str], optional, default = None
-        list of column names identifying a time series instance within ``data``.
-        This means that the ``group`` together uniquely identify an instance,
-        and ``group`` together with ``time`` uniquely identify a single observation
-        within a time series instance.
-        If ``None``, the dataset is assumed to be a single time series.
-    weight : str, optional, default=None
-        column name for weights.
-        If ``None``, it is assumed that there is no weight column.
-    num : list of str, optional, default = all columns with dtype in "fi"
-        list of numerical variables in ``data``,
-        list may also contain list of str, which are then grouped together.
-    cat : list of str, optional, default = all columns with dtype in "Obc"
-        list of categorical variables in ``data``,
-        list may also contain list of str, which are then grouped together
-        (e.g. useful for product categories).
-    known : list of str, optional, default = all variables
-        list of variables that change over time and are known in the future,
-        list may also contain list of str, which are then grouped together
-        (e.g. useful for special days or promotion categories).
-    unknown : list of str, optional, default = no variables
-        list of variables that are not known in the future,
-        list may also contain list of str, which are then grouped together
-        (e.g. useful for weather categories).
-    static : list of str, optional, default = all variables not in known, unknown
-        list of variables that do not change over time,
-        list may also contain list of str, which are then grouped together.
-    image_col_start: Starting pixel of image data, left -> right, top -> bottom order.
-    image_col_end: Ending pixel of image data, left -> right, top -> bottom order.
-    image_shape: Shape of image data, (C, H, W).
     """
 
     def __init__(
@@ -81,6 +30,18 @@ class TimeSeriesWithImage(Dataset):
         image_shape: Optional[Tuple[int, int, int]] = None,
         future_image: Optional[bool] = False,
     ):
+        
+        if time is None:
+            raise ValueError("Require Time Index column")
+        if target is None:
+            raise ValueError("Require Target column")
+        
+        if image_cols_start is None or image_cols_end is None or image_shape is None:
+            raise ValueError(
+                "TimeSeriesWithImage requires image_cols_start, image_cols_end, "
+                "and image_shape to be provided and non-None"
+            )
+    
         self.data = data
         self.data_future = data_future
         self.time = time
@@ -116,8 +77,15 @@ class TimeSeriesWithImage(Dataset):
         self.feature_cols = [
             col
             for col in data.columns
-            if col not in [self.time] + self._group + [self.weight] + self._target + self._img
+            if col
+            not in [self.time]
+            + self._group
+            + [self.weight]
+            + self._target
+            + self._img
+            + self._static
         ]
+        
         if self._group:
             self._groups = self.data.groupby(self._group).groups
             self._group_ids = list(self._groups.keys())
@@ -125,206 +93,182 @@ class TimeSeriesWithImage(Dataset):
             self._groups = {"_single_group": self.data.index}
             self._group_ids = ["_single_group"]
 
+        if self.data_future is not None and self._group:
+            self._future_groups = self.data_future.groupby(self._group).groups
+
+        self.known_ts_feats   = [c for c in self.feature_cols if c in self._known]
+        self.unknown_ts_feats = [c for c in self.feature_cols if c not in self._known]
+        self.group_to_idx = {g: i for i, g in enumerate(self._group_ids)}
+
+        self.unknown_img = self._img if not self.future_image else []
+        self.known_img   = self._img if     self.future_image else []
+
         self._prepare_metadata()
 
-        # overwrite __init__ params for upwards compatibility with AS PRs
-        # todo: should we avoid this and ensure classes are dataclass-like?
         self.group = self._group
         self.target = self._target
         self.num = self._num
         self.cat = self._cat
-        self.known = self._known
-        self.unknown = self._unknown
+        self.known_ts = self._known
+        self.unknown_ts = self._unknown
         self.static = self._static
 
     def _prepare_metadata(self):
         """Prepare metadata for the dataset.
-
-        The funcion returns metadata that contains:
-
-        * ``cols``: dict { 'y': list[str], 'x': list[str], 'st': list[str] }
-          Names of columns for y, x, and static features.
-          List elements are in same order as column dimensions.
-          Columns not appearing are assumed to be named (x0, x1, etc.),
-          (y0, y1, etc.), (st0, st1, etc.).
-        * ``col_type``: dict[str, str]
-          maps column names to data types "F" (numerical) and "C" (categorical).
-          Column names not occurring are assumed "F".
-        * ``col_known``: dict[str, str]
-          maps column names to "K" (future known) or "U" (future unknown).
-          Column names not occurring are assumed "K".
         """
         self.metadata = {
             "cols": {
                 "y": self._target,
                 "x": self.feature_cols,
+                "img": self._img,
+                "ts_known": self.known_ts_feats,
+                "ts_unknown": self.unknown_ts_feats,
                 "st": self._static,
-                "img": self._img
+                "img_known": self.known_img,
+                "img_unknown": self.unknown_img,
             },
             "col_type": {},
             "col_known": {},
             "img_size": self.image_shape
         }
 
-        all_cols = self._target + self.feature_cols + self._static + self._img
-        for col in all_cols:
+        for col in self.feature_cols + self._target + self._static + self._img:
             if col in self._img:
-                col_type = "IMG"
+                t = "IMG"
             elif col in self._cat:
-                col_type = "C"
+                t = "C"
             else:
-                col_type = "F"
-            self.metadata["col_type"][col] = col_type
-            self.metadata["col_known"][col] = "K" if col in self._known else "U"
+                t = "F"
+            self.metadata["col_type"][col] = t
 
-        if self.future_image:
-            for col in self._img:
-                self.metadata["col_known"][col] = "K"
+        # 2) col_known: exactly which columns your decoder will see
+        #    - targets are historical only ("U")
+        #    - known_feats are known at forecast time ("K")
+        #    - unknown_feats are historical only ("U")
+        #    - static always known ("K")
+        #    - images known only if future_image=True
+        for col in self._target:
+            self.metadata["col_known"][col] = "U"
+        for col in self.known_ts_feats:
+            self.metadata["col_known"][col] = "K"
+        for col in self.unknown_ts_feats:
+            self.metadata["col_known"][col] = "U"
+        for col in self._static:
+            self.metadata["col_known"][col] = "K"
+        for col in self.known_img:
+            self.metadata["col_known"][col] = "K"
+        for col in self.unknown_img:
+            self.metadata["col_known"][col] = "U"
                 
+        self.metadata["cols"]["mask"] = ["valid_mask"]
+
     def __len__(self) -> int:
         """Return number of time series in the dataset."""
         return len(self._group_ids)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Get time series data for given index.
+        """Fetch one series (past + optional future), with image frames."""
+        group_key = self._group_ids[index]
+        group_idx = self.group_to_idx[group_key]
 
-        Returns
-        -------
-        t : numpy.ndarray of shape (n_timepoints,)
-            Time index for each time point in the past or present. Aligned with `y`,
-            and `x` not ending in `f`.
-
-        y : torch.Tensor of shape (n_timepoints, n_targets)
-            Target values for each time point. Rows are time points, aligned with `t`.
-
-        x : torch.Tensor of shape (n_timepoints, n_features)
-            Features for each time point. Rows are time points, aligned with `t`.
-
-        group : torch.Tensor of shape (n_groups,)
-            Group identifiers for time series instances.
-
-        st : torch.Tensor of shape (n_static_features,)
-            Static features.
-
-        img: torch.Tensor of shape (n_timepoints, )
-
-        cutoff_time : float or numpy.float64
-            Cutoff time for the time series instance.
-
-        Other Returns
-        -------------
-        weights : torch.Tensor of shape (n_timepoints,), optional
-            Only included if weights are not `None`.
-        """
-        time = self.time
-        feature_cols = self.feature_cols
-        _target = self._target
-        _known = self._known
-        _static = self._static
-        _group = self._group
-        _groups = self._groups
-        _group_ids = self._group_ids
-        weight = self.weight
-        data_future = self.data_future
-        image_cols = self._img
-        image_shape = self.image_shape
-
-        group_id = _group_ids[index]
-
-        if _group:
-            mask = _groups[group_id]
-            data = self.data.loc[mask]
+        if self._group:
+            mask = self._groups[group_key]
+            series = self.data.loc[mask]
         else:
-            data = self.data
+            series = self.data
 
-        cutoff_time = data[time].max()
+        t_past = series[self.time].values
+        y_past = series[self._target].values
+        if y_past.ndim == 1:
+            y_past = y_past.reshape(-1, 1)
+        x_past = series[self.feature_cols].values
+        img_past = series[self._img].values.astype(float)
 
-        data_vals = data[time].values
-        data_tgt_vals = data[_target].values
-        data_feat_vals = data[feature_cols].values
-        data_img_vals = data[image_cols].values.astype(float)
+        # store cutoff
+        cutoff = t_past.max()
 
-        T = data_img_vals.shape[0]
-        C, H, W = image_shape
+        # now, if there's future data, merge it
+        if self.data_future is not None:
+            if self._group:
+                fut_mask = self._future_groups[group_key]
+                fut = self.data_future.loc[fut_mask]
+            else:
+                fut = self.data_future
 
-        result = {
-            "t": data_vals,
-            "y": torch.tensor(data_tgt_vals),
-            "x": torch.tensor(data_feat_vals),
-            "group": torch.tensor([hash(str(group_id))]),
-            "st": torch.tensor(data[_static].iloc[0].values if _static else []),
-            "img": torch.tensor(data_img_vals.reshape(T,C,H,W), dtype=torch.float32),
-            "cutoff_time": cutoff_time,
+            t_fut = fut[self.time].values
+            # build full timeline
+            times = np.unique(np.concatenate([t_past, t_fut]))
+            times.sort()
+            N = len(times)
+
+            # allocate arrays (+ mask for “is real?”)
+            x_all   = np.full((N, len(self.feature_cols)), np.nan, dtype=float)
+            y_all   = np.full((N, len(self._target)),      np.nan, dtype=float)
+            img_all = np.full((N, *self.image_shape),      np.nan, dtype=float)
+            valid   = np.zeros(N, dtype=bool)
+
+            idx_map = {t: i for i, t in enumerate(times)}
+            # fill past
+            for i, t in enumerate(t_past):
+                j = idx_map[t]
+                x_all[j]   = x_past[i]
+                y_all[j]   = y_past[i]
+                img_all[j] = img_past[i].reshape(self.image_shape)
+                valid[j]   = True
+
+            # fill known future features (and images if requested)
+            for i, t in enumerate(t_fut):
+                j = idx_map[t]
+                for col in self._known:
+                    if col in self.feature_cols:
+                        k = self.feature_cols.index(col)
+                        x_all[j, k] = fut[col].iat[i]
+                if self.future_image:
+                    img_all[j] = fut[self._img].values[i].reshape(self.image_shape)
+                # leave valid[j] = False, so model knows these are “to predict”
+
+            # overwrite past arrays
+            t_arr   = times
+            x_arr   = x_all
+            y_arr   = y_all
+            img_arr = img_all
+
+        else:
+            # no future—just past
+            t_arr   = t_past
+            x_arr   = x_past
+            y_arr   = y_past
+            img_arr = img_past.reshape(len(t_past), *self.image_shape)
+            valid   = np.ones(len(t_past), dtype=bool)
+
+        t_tensor = torch.tensor(t_arr, dtype=torch.long)
+
+        if self._static:
+            st_vals = series[self._static].iloc[0].values.astype(float)
+            st_tensor = torch.tensor(st_vals, dtype=torch.float32)
+        else:
+            # make an empty float32 tensor
+            st_tensor = torch.empty(0, dtype=torch.float32)
+
+        # build output dict
+        out = {
+            "t":             t_tensor,
+            "y":             torch.tensor(y_arr, dtype=torch.float32),
+            "x":             torch.tensor(x_arr, dtype=torch.float32),
+            "img":           torch.tensor(img_arr, dtype=torch.float32),
+            "group":         torch.tensor([group_idx], dtype=torch.long),
+            "st":            st_tensor,
+            "cutoff_time":   torch.tensor(cutoff, dtype=torch.float32),
+            "valid_mask":    torch.tensor(valid, dtype=torch.bool),
         }
 
-        if data_future is not None:
-            if _group:
-                future_mask = self.data_future.groupby(_group).groups[group_id]
-                future_data = self.data_future.loc[future_mask]
-            else:
-                future_data = self.data_future
+        # weights if present
+        if self.weight:
+            w_arr = (fut[self.weight].values if self.data_future is not None else series[self.weight].values)
+            out["weights"] = torch.tensor(w_arr, dtype=torch.float32)
 
-            data_fut_vals = future_data[time].values
+        return out
 
-            combined_times = np.concatenate([data_vals, data_fut_vals])
-            combined_times = np.unique(combined_times)
-            combined_times.sort()
-
-            num_timepoints = len(combined_times)
-            x_merged = np.full((num_timepoints, len(feature_cols)), np.nan)
-            y_merged = np.full((num_timepoints, len(_target)), np.nan)
-            img_merged = np.full((num_timepoints, C, H, W), np.nan)
-
-            current_time_indices = {t: i for i, t in enumerate(combined_times)}
-            for i, t in enumerate(data_vals):
-                idx = current_time_indices[t]
-                x_merged[idx] = data_feat_vals[i]
-                y_merged[idx] = data_tgt_vals[i]
-                img_merged[idx] = data_img_vals[i].reshape(C, H, W)
-
-            for i, t in enumerate(data_fut_vals):
-                if t in current_time_indices:
-                    idx = current_time_indices[t]
-                    for j, col in enumerate(_known):
-                        if col in feature_cols:
-                            feature_idx = feature_cols.index(col)
-                            x_merged[idx, feature_idx] = future_data[col].values[i]
-
-            if self.future_image:
-                fut_img_flat = future_data[image_cols].values.astype(float)
-                for i, t in enumerate(data_fut_vals):
-                    if t in current_time_indices:
-                        idx = current_time_indices[t]
-                        img_merged[idx] = fut_img_flat[i].reshape(C, H, W)
-
-            result.update(
-                {
-                    "t": combined_times,
-                    "x": torch.tensor(x_merged, dtype=torch.float32),
-                    "y": torch.tensor(y_merged, dtype=torch.float32),
-                    "img": torch.tensor(img_merged, dtype=torch.float32),
-                }
-            )
-
-        if weight:
-            if self.data_future is not None and self.weight in self.data_future.columns:
-                weights_merged = np.full(num_timepoints, np.nan)
-                for i, t in enumerate(data_vals):
-                    idx = current_time_indices[t]
-                    weights_merged[idx] = data[weight].values[i]
-
-                for i, t in enumerate(data_fut_vals):
-                    if t in current_time_indices and self.weight in future_data.columns:
-                        idx = current_time_indices[t]
-                        weights_merged[idx] = future_data[weight].values[i]
-
-                result["weights"] = torch.tensor(weights_merged, dtype=torch.float32)
-            else:
-                result["weights"] = torch.tensor(
-                    data[self.weight].values, dtype=torch.float32
-                )
-
-        return result
 
     def get_metadata(self) -> dict:
         """Return metadata about the dataset.

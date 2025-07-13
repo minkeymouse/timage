@@ -109,8 +109,8 @@ class Timage(BaseModel):
             dropout=dropout,
         )
 
-        d_model = hidden_size_ts  # set attention model dim equal to time-series embedding dim
-        n_heads = 8  # number of attention heads (adjustable if needed)
+        d_model = self.encoder_hidden_size
+        n_heads = 8  
         self.cross_attn = AttentionLayer(
             FullAttention(mask_flag=False, attention_dropout=dropout, output_attention=False),
             d_model=d_model,
@@ -118,12 +118,13 @@ class Timage(BaseModel):
         )
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size_ts,
+            d_model=self.encoder_hidden_size,
             nhead=8,
             dim_feedforward=hidden_size_ts * 4,
             dropout=dropout,
             batch_first=True,
         )
+        
         self.state_encoder = nn.TransformerEncoder(
             encoder_layer,
             num_layers=2,

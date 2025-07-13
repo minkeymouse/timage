@@ -42,6 +42,7 @@ def main(cfg: DictConfig) -> None:
     # 5) ------------------------------------------------------------------ TimeSeriesDataSets
     #    Always build val/test from *train* to share encoders & scalers
     train_ds = hydra.utils.instantiate(cfg.dataset, data=train_df)
+    train_ds.save("train_dataset.pkl")  
     val_ds   = TimeSeriesDataSet.from_dataset(
         train_ds, val_df, stop_randomization=True, predict=True
     )

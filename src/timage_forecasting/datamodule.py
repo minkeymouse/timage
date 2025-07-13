@@ -1,89 +1,43 @@
 from typing import Any, Optional, Union, cast
-from warnings import warn
 
 from lightning.pytorch import LightningDataModule
-from sklearn.preprocessing import RobustScaler, StandardScaler
 import torch
 from torch.utils.data import DataLoader, Dataset
+
+from sklearn.preprocessing import StandardScaler, RobustScaler
 
 from pytorch_forecasting.data.encoders import (
     EncoderNormalizer,
     NaNLabelEncoder,
     TorchNormalizer,
+    GroupNormalizer,
+    MultiNormalizer
 )
-from pytorch_forecasting.utils._coerce import _coerce_to_dict
 
+from timage_forecasting.utils import _coerce_to_dict
 from timage_forecasting.dataset import TimeSeriesWithImage
 
-NORMALIZER = Union[TorchNormalizer, NaNLabelEncoder, EncoderNormalizer]
+NORMALIZER = Union[TorchNormalizer, EncoderNormalizer, GroupNormalizer, MultiNormalizer]
 
-class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
+class TimeSeriesWithImageDataModule(LightningDataModule):
     """
-    Lightning DataModule for processing time series data in an encoder-decoder format.
-
-    This module handles preprocessing, splitting, and batching of time series data
-    for use in deep learning models. It supports categorical and continuous features,
-    various scalers, and automatic target normalization.
-
-    Parameters
-    ----------
-    time_series_dataset : TimeSeries
-        The dataset containing time series data.
-    max_encoder_length : int, default=30
-        Maximum length of the encoder input sequence.
-    min_encoder_length : Optional[int], default=None
-        Minimum length of the encoder input sequence.
-        Defaults to `max_encoder_length` if not specified.
-    max_prediction_length : int, default=1
-        Maximum length of the decoder output sequence.
-    min_prediction_length : Optional[int], default=None
-        Minimum length of the decoder output sequence.
-        Defaults to `max_prediction_length` if not specified.
-    min_prediction_idx : Optional[int], default=None
-        Minimum index from which predictions start.
-    allow_missing_timesteps : bool, default=False
-        Whether to allow missing timesteps in the dataset.
-    add_relative_time_idx : bool, default=False
-        Whether to add a relative time index feature.
-    add_target_scales : bool, default=False
-        Whether to add target scaling information.
-    add_encoder_length : Union[bool, str], default="auto"
-        Whether to include encoder length information.
-    target_normalizer :
-        Union[NORMALIZER, str, List[NORMALIZER], Tuple[NORMALIZER], None],
-         default="auto"
-        Normalizer for the target variable. If "auto", uses `RobustScaler`.
-
-    categorical_encoders : Optional[Dict[str, NaNLabelEncoder]], default=None
-        Dictionary of categorical encoders.
-
-    scalers :
-    Optional[Dict[str, Union[StandardScaler, RobustScaler,
-                        TorchNormalizer, EncoderNormalizer]]], default=None
-        Dictionary of feature scalers.
-
-    randomize_length : Union[None, Tuple[float, float], bool], default=False
-        Whether to randomize input sequence length.
-    batch_size : int, default=32
-        Batch size for DataLoader.
-    num_workers : int, default=0
-        Number of workers for DataLoader.
-    train_val_test_split : tuple, default=(0.7, 0.15, 0.15)
-        Proportions for train, validation, and test dataset splits.
+    doc
     """
 
     def __init__(
         self,
-        time_series_with_image_dataset: TimeSeriesWithImage,
-        max_encoder_length: int = 30,
-        min_encoder_length: Optional[int] = None,
-        max_prediction_length: int = 1,
-        min_prediction_length: Optional[int] = None,
+
+        # Metadata from training dataset
+        train_ds: TimeSeriesWithImage,
+        val_ds: Optional[TimeSeriesWithImage] = None,
+        test_ds: Optional[TimeSeriesWithImage] = None,
+        predict_ds: Optional[TimeSeriesWithImage] = None,
+
+        encoder_length: int = 30,
+        prediction_length: int = 1,
         min_prediction_idx: Optional[int] = None,
-        allow_missing_timesteps: bool = False,
-        add_relative_time_idx: bool = False,
+        
         add_target_scales: bool = False,
-        add_encoder_length: Union[bool, str] = "auto",
         target_normalizer: Union[
             NORMALIZER, str, list[NORMALIZER], tuple[NORMALIZER], None
         ] = "auto",
@@ -91,277 +45,168 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
         scalers: Optional[
             dict[
                 str,
-                Union[StandardScaler, RobustScaler, TorchNormalizer, EncoderNormalizer],
+                Union[TorchNormalizer, EncoderNormalizer],
             ]
         ] = None,
-        randomize_length: Union[None, tuple[float, float], bool] = False,
+
         batch_size: int = 32,
         num_workers: int = 0,
+        train_val_split: tuple = (0.8, 0.2),
         train_val_test_split: tuple = (0.7, 0.15, 0.15),
     ):
-        self.time_series_with_image_dataset = time_series_with_image_dataset
-        self.max_encoder_length = max_encoder_length
-        self.min_encoder_length = min_encoder_length
-        self.max_prediction_length = max_prediction_length
-        self.min_prediction_length = min_prediction_length
+        super().__init__()
+        # Need dataset
+        self.train_ds = train_ds
+        self.test_ds = test_ds
+        self.val_ds = val_ds
+        self.predict_ds = predict_ds
+        self.train_ds_metadata = train_ds.get_metadata()
+
+        # Encoder, Decoder spec
+        self.encoder_length = encoder_length
+        self.prediction_length = prediction_length
         self.min_prediction_idx = min_prediction_idx
-        self.allow_missing_timesteps = allow_missing_timesteps
-        self.add_relative_time_idx = add_relative_time_idx
+
+        # Scaler and Normalizers
         self.add_target_scales = add_target_scales
-        self.add_encoder_length = add_encoder_length
-        self.randomize_length = randomize_length
         self.target_normalizer = target_normalizer
         self.categorical_encoders = categorical_encoders
         self.scalers = scalers
+
+        # Training spec
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.train_val_split = train_val_split
         self.train_val_test_split = train_val_test_split
 
-        super().__init__()
-
-        # handle defaults and derived attributes
         if isinstance(target_normalizer, str) and target_normalizer.lower() == "auto":
-            self._target_normalizer = RobustScaler()
+            self._target_normalizer = TorchNormalizer()
         else:
             self._target_normalizer = target_normalizer
 
-        self.time_series_with_image_metadata = time_series_with_image_dataset.get_metadata()
-        self._min_prediction_length = min_prediction_length or max_prediction_length
-        self._min_encoder_length = min_encoder_length or max_encoder_length
         self._categorical_encoders = _coerce_to_dict(categorical_encoders)
         self._scalers = _coerce_to_dict(scalers)
-
-        self.categorical_indices = []
-        self.continuous_indices = []
-        self.image_indices = []
         self._metadata = None
 
-        for idx, col in enumerate(self.time_series_with_image_metadata["cols"]["x"]):
-            if self.time_series_with_image_metadata["col_type"].get(col) == "C":
-                self.categorical_indices.append(idx)
-            else:
-                self.continuous_indices.append(idx)
-
-        for idx, col in enumerate(self.time_series_with_image_metadata["cols"]["img"]):
-            self.image_indices.append(idx)
-
     def _prepare_metadata(self):
-        """Prepare metadata for model initialisation.
+        ds_meta   = self.train_ds_metadata
+        cols      = ds_meta["cols"]
+        col_type  = ds_meta["col_type"]
+        col_known = ds_meta["col_known"]
+        image_size= ds_meta["img_size"]
 
-        Returns
-        -------
-        dict
-            dictionary containing the following keys:
+        # encoder (all time-varying) features
+        enc_cat  = [c for c in cols["x"] if col_type[c] == "C"]
+        enc_cont = [c for c in cols["x"] if col_type[c] == "F"]
+        enc_img  = cols["img"]  # all image columns
 
-            * ``encoder_cat``: Number of categorical variables in the encoder.
-                Computed as ``len(self.categorical_indices)``, which counts the
-                categorical feature indices.
-            * ``encoder_cont``: Number of continuous variables in the encoder.
-                Computed as ``len(self.continuous_indices)``, which counts the
-                continuous feature indices.
-            * ``decoder_cat``: Number of categorical variables in the decoder that
-                are known in advance.
-                Computed by filtering ``self.time_series_metadata["cols"]["x"]``
-                where col_type == "C"(categorical) and col_known == "K" (known)
-            * ``decoder_cont``:  Number of continuous variables in the decoder that
-                are known in advance.
-                Computed by filtering ``self.time_series_metadata["cols"]["x"]``
-                where col_type == "F"(continuous) and col_known == "K"(known)
-            * ``target``: Number of target variables.
-                Computed as ``len(self.time_series_metadata["cols"]["y"])``, which
-                gives the number of output target columns..
-            * ``static_categorical_features``: Number of static categorical features
-                Computed by filtering ``self.time_series_metadata["cols"]["st"]``
-                (static features) where col_type == "C" (categorical).
-            * ``static_continuous_features``: Number of static continuous features
-                Computed as difference of
-                ``len(self.time_series_metadata["cols"]["st"])`` (static features)
-                and static_categorical_features that gives static continuous feature
-            * ``max_encoder_length``: maximum encoder length
-                Taken directly from `self.max_encoder_length`.
-            * ``max_prediction_length``: maximum prediction length
-                Taken directly from `self.max_prediction_length`.
-            * ``min_encoder_length``: minimum encoder length
-                Taken directly from `self.min_encoder_length`.
-            * ``min_prediction_length``: minimum prediction length
-                Taken directly from `self.min_prediction_length`.
-        """
-        encoder_cat_count = len(self.categorical_indices)
-        encoder_cont_count = len(self.continuous_indices)
-        encoder_img_count = len(self.image_indices)
+        # decoder (known at forecast) features
+        dec_cat  = [c for c in cols["x"] if col_known[c] == "K" and col_type[c] == "C"]
+        dec_cont = [c for c in cols["x"] if col_known[c] == "K" and col_type[c] == "F"]
+        dec_img  = cols.get("img_known", [])  # only those images flagged K
 
-        decoder_cat_count = len(
-            [
-                col
-                for col in self.time_series_with_image_metadata["cols"]["x"]
-                if self.time_series_with_image_metadata["col_type"].get(col) == "C"
-                and self.time_series_with_image_metadata["col_known"].get(col) == "K"
-            ]
-        )
-        decoder_cont_count = len(
-            [
-                col
-                for col in self.time_series_with_image_metadata["cols"]["x"]
-                if self.time_series_with_image_metadata["col_type"].get(col) == "F"
-                and self.time_series_with_image_metadata["col_known"].get(col) == "K"
-            ]
-        )
+        # static
+        st_cat   = [c for c in cols["st"] if col_type[c] == "C"]
+        st_cont  = [c for c in cols["st"] if col_type[c] == "F"]
 
-        decoder_img_count = len(
-            [
-                col
-                for col in self.time_series_with_image_metadata["cols"]["img"]
-                if self.time_series_with_image_metadata["col_type"].get(col) == "F"
-                and self.time_series_with_image_metadata["col_known"].get(col) == "K"
-            ]
-        )
+        # targets
+        target_count = len(cols["y"])
 
-        image_size = self.time_series_with_image_metadata["image_size"]
-
-        target_count = len(self.time_series_with_image_metadata["cols"]["y"])
         metadata = {
-            "encoder_cat": encoder_cat_count,
-            "encoder_cont": encoder_cont_count,
-            "encoder_img": encoder_img_count,
-            "decoder_cat": decoder_cat_count,
-            "decoder_cont": decoder_cont_count,
-            "decoder_img": decoder_img_count,
+            "encoder_cat": len(enc_cat),
+            "encoder_cont": len(enc_cont),
+            "encoder_img": len(enc_img),
+            "decoder_cat": len(dec_cat),
+            "decoder_cont": len(dec_cont),
+            "decoder_img": len(dec_img),
+            "static_cat": len(st_cat),
+            "static_cont": len(st_cont),
             "target": target_count,
             "image_size": image_size,
+            "encoder_length": self.encoder_length,
+            "prediction_length": self.prediction_length,
         }
-        if self.time_series_with_image_metadata["cols"]["st"]:
-            static_cat_count = len(
-                [
-                    col
-                    for col in self.time_series_with_image_metadata["cols"]["st"]
-                    if self.time_series_with_image_metadata["col_type"].get(col) == "C"
-                ]
-            )
-            static_cont_count = (
-                len(self.time_series_with_image_metadata["cols"]["st"]) - static_cat_count
-            )
-
-            metadata["static_categorical_features"] = static_cat_count
-            metadata["static_continuous_features"] = static_cont_count
-        else:
-            metadata["static_categorical_features"] = 0
-            metadata["static_continuous_features"] = 0
-
-        metadata.update(
-            {
-                "max_encoder_length": self.max_encoder_length,
-                "max_prediction_length": self.max_prediction_length,
-                "min_encoder_length": self._min_encoder_length,
-                "min_prediction_length": self._min_prediction_length,
-            }
-        )
-
         return metadata
 
     @property
     def metadata(self):
-        """Compute metadata for model initialization.
-
-        This property returns a dictionary containing the shapes and key information
-        related to the time series model. The metadata includes:
-
-        * ``encoder_cat``: Number of categorical variables in the encoder.
-        * ``encoder_cont``: Number of continuous variables in the encoder.
-        * ``encoder_image``: Number of image pixels in the encoder.
-
-        * ``decoder_cat``: Number of categorical variables in the decoder that are
-                            known in advance.
-
-        * ``decoder_cont``:  Number of continuous variables in the decoder that are
-                            known in advance.
-        * ``decoder_image``: Number of image pixels in the decoder.
-        * ``target``: Number of target variables.
-
-        If static features are present, the following keys are added:
-
-        * ``static_categorical_features``: Number of static categorical features
-        * ``static_continuous_features``: Number of static continuous features
-
-        It also contains the following information:
-
-        * ``max_encoder_length``: maximum encoder length
-        * ``max_prediction_length``: maximum prediction length
-        * ``min_encoder_length``: minimum encoder length
-        * ``min_prediction_length``: minimum prediction length
-        """
         if self._metadata is None:
             self._metadata = self._prepare_metadata()
         return self._metadata
 
     def _preprocess_data(self, series_idx: Union[int, torch.Tensor]) -> dict[str, Any]:
-        """Preprocess the data before feeding it into _ProcessedEncoderDecoderDataset.
-
-        Preprocessing steps
-        --------------------
-
-        * Converts target (`y`) and features (`x`) to `torch.float32`.
-        * Masks time points that are at or before the cutoff time.
-        * Splits features into categorical and continuous subsets based on
-            predefined indices.
-
-
-        TODO: add scalers, target normalizers etc.
-        """
         if isinstance(series_idx, torch.Tensor):
-            series_idx = cast(int, series_idx.item())
+            series_idx = int(series_idx.item())
 
-        sample = self.time_series_with_image_dataset[series_idx]
+        sample = self.train_ds[series_idx]
+        raw_ts     = sample["x"]        # shape (T, n_time_features)
+        raw_img    = sample["img"]      # shape (T, C, H, W)
+        raw_y      = sample["y"]        # shape (T,) or (T, n_targets)
+        raw_st     = sample["st"]       # shape (n_static,)
+        valid_mask = sample["valid_mask"]
+        times      = sample["t"]
+        cutoff     = sample["cutoff_time"]
 
-        target = sample["y"]
-        features = sample["x"]
-        images = sample["img"]
-        times = sample["t"]
-        cutoff_time = sample["cutoff_time"]
+        ts_cov  = torch.as_tensor(raw_ts, dtype=torch.float32)
+        img_seq = torch.as_tensor(raw_img, dtype=torch.float32)
+        y_seq   = torch.as_tensor(raw_y, dtype=torch.float32)
+        st_cov  = torch.as_tensor(raw_st, dtype=torch.float32)
 
-        time_mask = torch.tensor(times <= cutoff_time, dtype=torch.bool)
+        ts_feature_cols = self.train_ds_metadata["cols"]["x"]
+        is_cat = [self.train_ds_metadata["col_type"][c]=="C" for c in ts_feature_cols]
+        cat_idxs = [i for i,flag in enumerate(is_cat) if flag]
+        cont_idxs= [i for i,flag in enumerate(is_cat) if not flag]
 
-        if isinstance(target, torch.Tensor):
-            target = target.float()
+        ts_cat = []
+        if self.categorical_encoders is not None:
+            for idx in cat_idxs:
+                col = ts_feature_cols[idx]
+                codes = self.categorical_encoders[col].transform(ts_cov[:, idx].numpy())
+                ts_cat.append(torch.as_tensor(codes, dtype=torch.long))
+        ts_cat = torch.stack(ts_cat, dim=1) if ts_cat else torch.zeros((ts_cov.size(0),0),dtype=torch.long)
+
+        if hasattr(self, "_scalers"):
+            ts_cont = []
+            for idx in cont_idxs:
+                col = ts_feature_cols[idx]
+                vals = ts_cov[:, idx].unsqueeze(1).numpy()
+                scaled = self._scalers[col].transform(vals)
+                ts_cont.append(torch.as_tensor(scaled.squeeze(1), dtype=torch.float32))
+            ts_cont = torch.stack(ts_cont, dim=1)
         else:
-            target = torch.tensor(target, dtype=torch.float32)
+            ts_cont = ts_cov[:, cont_idxs]
 
-        if isinstance(features, torch.Tensor):
-            features = features.float()
-        else:
-            features = torch.tensor(features, dtype=torch.float32)
+        # 7) do the same for static categoricals vs static continuous
+        static_cols = self.train_ds_metadata["cols"]["st"]
+        is_cat_st = [self.train_ds_metadata["col_type"][c]=="C" for c in static_cols]
+        st_cat = []
+        st_cont = []
+        for i, col in enumerate(static_cols):
+            if is_cat_st[i] and self.categorical_encoders is not None:
+                code = self.categorical_encoders[col].transform([st_cov[i].item()])[0]
+                st_cat.append(torch.tensor(code, dtype=torch.long))
+            else:
+                st_cont.append(st_cov[i])
+        st_cat  = torch.stack(st_cat).unsqueeze(0)  if st_cat else torch.zeros((1,0),dtype=torch.long)
+        st_cont = torch.stack(st_cont).unsqueeze(0) if st_cont else torch.zeros((1,0),dtype=torch.float32)
 
-        if isinstance(images, torch.Tensor):
-            images = images.float()
-        else:
-            images = torch.tensor(images, dtype=torch.float32)
+        # 8) (optional) normalize your target
+        if isinstance(self._target_normalizer, TorchNormalizer):
+            y_seq = self._target_normalizer.transform(y_seq.unsqueeze(-1)).squeeze(-1)
 
-        # TODO: add scalers, target normalizers etc.
-
-        categorical = (
-            features[:, self.categorical_indices]
-            if self.categorical_indices
-            else torch.zeros((features.shape[0], 0))
-        )
-        continuous = (
-            features[:, self.continuous_indices]
-            if self.continuous_indices
-            else torch.zeros((features.shape[0], 0))
-        )
-
-
+        # 9) return a dict of everything
         return {
-            "features": {"categorical": categorical, "continuous": continuous},
-            "images": images,
-            "target": target,
-            "static": sample.get("st", None),
-            "group": sample.get("group", torch.tensor([0])),
-            "length": len(target),
-            "time_mask": time_mask,
-            "times": times,
-            "cutoff_time": cutoff_time,
+            "ts_covariates":     {"categorical": ts_cat,  "continuous": ts_cont},
+            "images":            img_seq,
+            "target":            y_seq,
+            "static_covariates": {"categorical": st_cat,  "continuous": st_cont},
+            "group":             sample["group"],
+            "valid_mask":        valid_mask,
+            "times":             times,
+            "cutoff_time":       cutoff,
         }
 
-    class _ProcessedEncoderDecoderDataset(Dataset):
+    class _ProcessedDataset(Dataset):
         """PyTorch Dataset for processed encoder-decoder time series data.
 
         Parameters
@@ -373,21 +218,17 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
         windows : List[Tuple[int, int, int, int]]
             List of window tuples containing
             (series_idx, start_idx, enc_length, pred_length).
-        add_relative_time_idx : bool, default=False
-            Whether to include relative time indices.
         """
 
         def __init__(
             self,
             dataset: TimeSeriesWithImage,
-            data_module: "EncoderDecoderTimeSeriesDataModule",
+            data_module: "TimeSeriesWithImageDataModule",
             windows: list[tuple[int, int, int, int]],
-            add_relative_time_idx: bool = False,
         ):
             self.dataset = dataset
             self.data_module = data_module
             self.windows = windows
-            self.add_relative_time_idx = add_relative_time_idx
 
         def __len__(self):
             return len(self.windows)
@@ -421,7 +262,7 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
             encoder_image = data["images"][encoder_indices]
 
             features = data["features"]
-            metadata = self.data_module.time_series_with_image_metadata
+            metadata = self.data_module.metadata
 
             known_cat_indices = [
                 i
@@ -546,19 +387,19 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
 
         for idx in indices:
             series_idx = cast(int, idx.item())
-            sample = self.time_series_with_image_dataset[series_idx]
+            sample = self.train_ds[series_idx]
             sequence_length = len(sample["y"])
 
-            if sequence_length < self.max_encoder_length + self.max_prediction_length:
+            if sequence_length < self.encoder_length + self.prediction_length:
                 continue
 
             effective_min_prediction_idx = (
                 self.min_prediction_idx
                 if self.min_prediction_idx is not None
-                else self.max_encoder_length
+                else self.encoder_length
             )
 
-            max_prediction_idx = sequence_length - self.max_prediction_length + 1
+            max_prediction_idx = sequence_length - self.prediction_length + 1
 
             if max_prediction_idx <= effective_min_prediction_idx:
                 continue
@@ -567,15 +408,15 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
                 0, max_prediction_idx - effective_min_prediction_idx
             ):
                 if (
-                    start_idx + self.max_encoder_length + self.max_prediction_length
+                    start_idx + self.encoder_length + self.prediction_length
                     <= sequence_length
                 ):
                     windows.append(
                         (
                             series_idx,
                             start_idx,
-                            self.max_encoder_length,
-                            self.max_prediction_length,
+                            self.encoder_length,
+                            self.prediction_length,
                         )
                     )
 
@@ -593,53 +434,66 @@ class EncoderDecoderTimeSeriesDataModule(LightningDataModule):
             - ``"predict"`` : Prepares the dataset for inference.
             - ``None`` : Prepares ``fit`` datasets.
         """
-        total_series = len(self.time_series_with_image_dataset)
-        self._split_indices = torch.randperm(total_series)
 
-        self._train_size = int(self.train_val_test_split[0] * total_series)
-        self._val_size = int(self.train_val_test_split[1] * total_series)
+        if hasattr(self, "test_dataset"):
+            total_train_series = len(self.train_ds)
+            self._split_indices = torch.randperm(total_train_series)
 
-        self._train_indices = self._split_indices[: self._train_size]
-        self._val_indices = self._split_indices[
-            self._train_size : self._train_size + self._val_size
-        ]
-        self._test_indices = self._split_indices[self._train_size + self._val_size :]
+            self._train_size = int(self.train_val_split[0] * total_train_series)
+            self._val_size = int(self.train_val_split[1] * total_train_series)
+
+        elif hasattr(self, "pred_ds"):
+            # This is full prediction mode so we use pred_ds to produce output.
+
+            stage == "prediction"
+
+
+        else:
+            total_series = len(self.train_ds)
+            self._split_indices = torch.randperm(total_series)
+
+            self._train_size = int(self.train_val_test_split[0] * total_series)
+            self._val_size = int(self.train_val_test_split[1] * total_series)
+
+            self._train_indices = self._split_indices[: self._train_size]
+            self._val_indices = self._split_indices[
+                self._train_size : self._train_size + self._val_size
+            ]
+            self._test_indices = self._split_indices[self._train_size + self._val_size :]
 
         if stage is None or stage == "fit":
             if not hasattr(self, "train_dataset") or not hasattr(self, "val_dataset"):
                 self.train_windows = self._create_windows(self._train_indices)
                 self.val_windows = self._create_windows(self._val_indices)
 
-                self.train_dataset = self._ProcessedEncoderDecoderDataset(
-                    self.time_series_with_image_dataset,
+                self.train_dataset = self._ProcessedDataset(
+                    self.train_ds,
                     self,
                     self.train_windows,
-                    self.add_relative_time_idx,
                 )
-                self.val_dataset = self._ProcessedEncoderDecoderDataset(
-                    self.time_series_with_image_dataset,
+                self.val_dataset = self._ProcessedDataset(
+                    self.train_ds,
                     self,
                     self.val_windows,
-                    self.add_relative_time_idx,
                 )
 
         elif stage == "test":
+            if hasattr(self, "test_dataset"):
+                self.test_windows = self._create_windows(self.test_indices)
             if not hasattr(self, "test_dataset"):
                 self.test_windows = self._create_windows(self._test_indices)
-                self.test_dataset = self._ProcessedEncoderDecoderDataset(
-                    self.time_series_with_image_dataset,
+                self.test_dataset = self._ProcessedDataset(
+                    self.train_ds,
                     self,
                     self.test_windows,
-                    self.add_relative_time_idx,
                 )
         elif stage == "predict":
-            predict_indices = torch.arange(len(self.time_series_with_image_dataset))
+            predict_indices = torch.arange(len(self.))
             self.predict_windows = self._create_windows(predict_indices)
-            self.predict_dataset = self._ProcessedEncoderDecoderDataset(
-                self.time_series_with_image_dataset,
+            self.predict_dataset = self._ProcessedDataset(
+                self.train_ds,
                 self,
                 self.predict_windows,
-                self.add_relative_time_idx,
             )
 
     def train_dataloader(self):
