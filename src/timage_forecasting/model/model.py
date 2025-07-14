@@ -12,10 +12,10 @@ from pytorch_forecasting.models.nn.embeddings import MultiEmbedding
 from pytorch_forecasting.models.tide.sub_modules import _ResidualBlock
 from pytorch_forecasting.models.timexer.sub_modules import AttentionLayer, FullAttention
 
-from timage_forecasting.base import BaseModel
-from timage_forecasting.dataset import TimeSeriesWithImage
-from timage_forecasting.datamodule import EncoderDecoderTimeSeriesDataModule
-from timage_forecasting.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
+from timage_forecasting.model.base import BaseModel
+from timage_forecasting.datamodule.dataset import TimeSeriesWithImage
+from timage_forecasting.datamodule.datamodule import EncoderDecoderTimeSeriesDataModule
+from timage_forecasting.model.sub_modules import _TimeSeriesEncoder, _TemporalImageEncoder
 
 import warnings
 

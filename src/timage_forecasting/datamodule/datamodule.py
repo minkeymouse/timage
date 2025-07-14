@@ -15,7 +15,7 @@ from pytorch_forecasting.data.encoders import (
 )
 
 from timage_forecasting.utils import _coerce_to_dict
-from timage_forecasting.dataset import TimeSeriesWithImage
+from timage_forecasting.datamodule.dataset import TimeSeriesWithImage
 
 NORMALIZER = Union[TorchNormalizer, EncoderNormalizer, GroupNormalizer, MultiNormalizer]
 
@@ -176,7 +176,6 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         else:
             ts_cont = ts_cov[:, cont_idxs]
 
-        # 7) do the same for static categoricals vs static continuous
         static_cols = self.train_ds_metadata["cols"]["st"]
         is_cat_st = [self.train_ds_metadata["col_type"][c]=="C" for c in static_cols]
         st_cat = []
@@ -194,7 +193,6 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         if isinstance(self._target_normalizer, TorchNormalizer):
             y_seq = self._target_normalizer.transform(y_seq.unsqueeze(-1)).squeeze(-1)
 
-        # 9) return a dict of everything
         return {
             "ts_covariates":     {"categorical": ts_cat,  "continuous": ts_cont},
             "images":            img_seq,
