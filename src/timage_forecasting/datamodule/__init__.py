@@ -1,6 +1,5 @@
-from datamodule import TimeSeriesWithImage, TimeSeriesWithImageDataModule
+from .dataset import TimeSeriesWithImage
 
 __all__ = [
     "TimeSeriesWithImage",
-    "TimeSeriesWithImageDataModule",
 ]
