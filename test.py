@@ -4,4 +4,4 @@ import numpy as np
 
 df = pd.read_csv("experiments/train_processed_img_task5.csv")
 
-print(df)
+print(df.head())

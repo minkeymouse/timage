@@ -23,11 +23,8 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
     """
     doc
     """
-
     def __init__(
         self,
-
-        # Metadata from training dataset
         train_ds: TimeSeriesWithImage,
         val_ds: Optional[TimeSeriesWithImage] = None,
         test_ds: Optional[TimeSeriesWithImage] = None,
@@ -51,23 +48,20 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
 
         batch_size: int = 32,
         num_workers: int = 0,
-        train_val_split: tuple = (0.8, 0.2),
+        train_val_split: tuple = (0.7, 0.3),
         train_val_test_split: tuple = (0.7, 0.15, 0.15),
     ):
         super().__init__()
-        # Need dataset
         self.train_ds = train_ds
         self.test_ds = test_ds
         self.val_ds = val_ds
         self.predict_ds = predict_ds
         self.train_ds_metadata = train_ds.get_metadata()
 
-        # Encoder, Decoder spec
         self.encoder_length = encoder_length
         self.prediction_length = prediction_length
         self.min_prediction_idx = min_prediction_idx
 
-        # Scaler and Normalizers
         self.add_target_scales = add_target_scales
         self.target_normalizer = target_normalizer
         self.categorical_encoders = categorical_encoders
@@ -95,22 +89,21 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         col_known = ds_meta["col_known"]
         image_size= ds_meta["img_size"]
 
-        # encoder (all time-varying) features
         enc_cat  = [c for c in cols["x"] if col_type[c] == "C"]
         enc_cont = [c for c in cols["x"] if col_type[c] == "F"]
-        enc_img  = cols["img"]  # all image columns
+        enc_img  = cols["img"]
 
-        # decoder (known at forecast) features
         dec_cat  = [c for c in cols["x"] if col_known[c] == "K" and col_type[c] == "C"]
         dec_cont = [c for c in cols["x"] if col_known[c] == "K" and col_type[c] == "F"]
-        dec_img  = cols.get("img_known", [])  # only those images flagged K
+        dec_img  = cols.get("img_known", [])
 
-        # static
         st_cat   = [c for c in cols["st"] if col_type[c] == "C"]
         st_cont  = [c for c in cols["st"] if col_type[c] == "F"]
 
         # targets
         target_count = len(cols["y"])
+        self.categorical_indices = [ cols["x"].index(c) for c in enc_cat ]
+        self.continuous_indices  = [ cols["x"].index(c) for c in enc_cont ]
 
         metadata = {
             "encoder_cat": len(enc_cat),
@@ -189,7 +182,6 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
         st_cat  = torch.stack(st_cat).unsqueeze(0)  if st_cat else torch.zeros((1,0),dtype=torch.long)
         st_cont = torch.stack(st_cont).unsqueeze(0) if st_cont else torch.zeros((1,0),dtype=torch.float32)
 
-        # 8) (optional) normalize your target
         if isinstance(self._target_normalizer, TorchNormalizer):
             y_seq = self._target_normalizer.transform(y_seq.unsqueeze(-1)).squeeze(-1)
 
@@ -325,11 +317,11 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
             }
             if data["static"] is not None:
                 raw_st_tensor = data.get("static")
-                static_col_names = self.data_module.time_series_with_image_metadata["cols"]["st"]
+                static_col_names = self.data_module.train_ds_metadata["cols"]["st"]
 
                 is_categorical_mask = torch.tensor(
                     [
-                        self.data_module.time_series_with_image_metadata["col_type"].get(col_name)
+                        self.data_module.train_ds_metadata["col_type"].get(col_name)
                         == "C"
                         for col_name in static_col_names
                     ],
@@ -365,7 +357,7 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
 
             return x, y
 
-    def _create_windows(self, indices: torch.Tensor) -> list[tuple[int, int, int, int]]:
+    def _create_windows(self, indices: torch.Tensor, dataset: TimeSeriesWithImage) -> list[tuple[int, int, int, int]]:
         """Generate sliding windows for training, validation, and testing.
 
         Returns
@@ -385,7 +377,7 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
 
         for idx in indices:
             series_idx = cast(int, idx.item())
-            sample = self.train_ds[series_idx]
+            sample = dataset[series_idx]
             sequence_length = len(sample["y"])
 
             if sequence_length < self.encoder_length + self.prediction_length:
@@ -422,16 +414,8 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         """Prepare the datasets for training, validation, testing, or prediction.
-
-        Parameters
-        ----------
-        stage : Optional[str], default=None
-            Specifies the stage of setup. Can be one of:
-            - ``"fit"`` : Prepares training and validation datasets.
-            - ``"test"`` : Prepares the test dataset.
-            - ``"predict"`` : Prepares the dataset for inference.
-            - ``None`` : Prepares ``fit`` datasets.
         """
+        if stage is None or stage == "fit":
 
         if hasattr(self, "test_dataset"):
             total_train_series = len(self.train_ds)
@@ -439,12 +423,6 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
 
             self._train_size = int(self.train_val_split[0] * total_train_series)
             self._val_size = int(self.train_val_split[1] * total_train_series)
-
-        elif hasattr(self, "pred_ds"):
-            # This is full prediction mode so we use pred_ds to produce output.
-
-            stage == "prediction"
-
 
         else:
             total_series = len(self.train_ds)
@@ -476,8 +454,16 @@ class TimeSeriesWithImageDataModule(LightningDataModule):
                 )
 
         elif stage == "test":
-            if hasattr(self, "test_dataset"):
-                self.test_windows = self._create_windows(self.test_indices)
+            if hasattr(self, "test_dataset") and self.test_ds is not None:
+                source_ds = self.test_ds
+                self._test_indices = torch.arange(len(source_ds))
+                test_windows = self._create_windows(self._test_indices)
+                self.test_windows = test_windows
+                self.test_dataset = self._ProcessedDataset(
+                    source_ds,
+                    self,
+                    self.test_windows
+                )
             if not hasattr(self, "test_dataset"):
                 self.test_windows = self._create_windows(self._test_indices)
                 self.test_dataset = self._ProcessedDataset(
